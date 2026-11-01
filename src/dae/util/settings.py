@@ -27,6 +27,8 @@ class Settings:
 		SETTINGS_DONT_EXPORT_EXISTING_TEXTURES:False,
 		SETTINGS_FORCE_DDS_CONVERSION:True,
 		SETTINGS_EXPAND_ALL:False,
+		SETTINGS_LANGUAGE:"auto",
+		SETTINGS_THEME:THEME_DARK,
 	}
 
 	def saveSettings(self):
@@ -58,7 +60,7 @@ class Settings:
 		self.saveSettings()
 	
 	def resetSettings(self):
-		self.__settings = self.__DEFAULT_SETTINGS
+		self.__settings = dict(self.__DEFAULT_SETTINGS)
 
 		self.saveSettings()
 

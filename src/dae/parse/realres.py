@@ -4,6 +4,8 @@ from typing import Iterable, Union
 
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
+from util.classproperty import classproperty
+
 
 import util.log as log
 from io import BytesIO
@@ -1223,8 +1225,7 @@ class ModelContainer(ABC):
 
 	
 class RealResData(Packed):
-	@classmethod
-	@property
+	@classproperty
 	@abstractmethod
 	def staticClassId(cls) -> int:
 		...
@@ -1233,8 +1234,7 @@ class RealResData(Packed):
 	def classId(self) -> int:
 		return self.staticClassId
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Real Resource Data"
 	
@@ -1250,13 +1250,11 @@ class RealResData(Packed):
 
 
 class UnknownResData(RealResData):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0x0
 	
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(cls) -> str:
 		return "unknown.bmp"
 
@@ -1264,13 +1262,11 @@ class UnknownResData(RealResData):
 	def classId(self) -> int:
 		return self.__classId
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "rrd"
 
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Unknown RRD"
 	
@@ -1288,23 +1284,19 @@ class UnknownResData(RealResData):
 		self.__classId = classId
 
 class GeomNodeTree(RealResData, ModelContainer):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0x56f81b6d
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "gnt"
 
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Skeleton"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self):
 		return "asset_skeleton.bmp"
 	
@@ -1530,23 +1522,19 @@ class GeomNodeTree(RealResData, ModelContainer):
 		return 1
 
 class RendInst(RealResData, ModelContainer):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0x77f8232f
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "ri"
 
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Renderable instance"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(cls):
 		return "asset_rendinst.bmp"
 	
@@ -1921,23 +1909,19 @@ class RendInst(RealResData, ModelContainer):
 		self.setCollisionGeom(self._getCachedAsset(CollisionGeom, "_collision"))
 
 class DynModel(RendInst):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0xb4b7d9c4
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "dyn"
 
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Dynamic model" # Dynamic renderable scene
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self):
 		return "asset_dynmodel.bmp"
 	
@@ -2249,23 +2233,19 @@ class DynModel(RendInst):
 
 
 class CollisionGeom(RealResData, ModelContainer):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0xace50000
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "col"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Collision geometry" # Dynamic renderable scene
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self):
 		return "asset_collision.bmp"
 	
@@ -2464,233 +2444,189 @@ class CollisionGeom(RealResData, ModelContainer):
 		return 1
 	
 class FX(RealResData):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0x88b7a117
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "fx"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Particle effect"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(cls):
 		return "asset_fx.bmp"
 
 class PhysObj(RealResData):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0xd543e771
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "phy"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Physics object"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(cls):
 		return "asset_physobj.bmp"
 
 class FastPhys(RealResData):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0x855a1be6
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "fphy"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Fast physics"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self):
 		return "asset_fastphys.bmp"
 
 class Anim2Data(RealResData):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0x40c586f9
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "a2d"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Anim2Data"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self):
 		return "asset_a2d.bmp"
 
 class AnimChar(RealResData):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0x8f2a701a
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "anm"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "AnimChar"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self):
 		return "asset_animTree.bmp"
 
 class Char(RealResData):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0xa6f87a9b
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "char"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Character"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self):
 		return "asset_character.bmp"
 
 class LandClass(RealResData):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0x3fb59c4
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "lcls"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Land class"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self):
 		return "asset_land.bmp"
 
 class MaterialClass(RealResData):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0x39b5b09e
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "mtl"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Material"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self):
 		return "asset_mat.bmp"
 
 class ImpostorData(RealResData):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0x2ad457f0
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "imp"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Impostor data"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self):
 		return "asset_rndgrass.bmp"
 
 class ShaderGraph(RealResData):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0xcd5b9736
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "sdr"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Shader graph"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self):
 		return "asset_shaderGraph.bmp"
 
 class RndGrass(RealResData):
-	@classmethod
-	@property
+	@classproperty
 	def staticClassId(cls) -> int:
 		return 0xa7d3ed6a
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "rnd"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Random grass"
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self):
 		return "asset_rndgrass.bmp"
 

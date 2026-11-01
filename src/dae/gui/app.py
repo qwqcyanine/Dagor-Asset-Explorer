@@ -8,7 +8,8 @@ import util.log as log
 import gc
 from PyQt5.uic import loadUi
 from PyQt5.QtCore import pyqtSignal, QDir, QFileInfo, QDirIterator, QRunnable, QThreadPool, QObject
-from PyQt5.QtWidgets import QMainWindow, QGridLayout, QAction, QFileDialog, QApplication
+from PyQt5.QtCore import Qt, QSize, QTranslator, QLibraryInfo
+from PyQt5.QtWidgets import QMainWindow, QGridLayout, QAction, QFileDialog, QApplication, QToolBar, QStyle, QLabel
 from PyQt5.QtGui import QIcon, QStandardItem
 from gui.customtreeview import CustomTreeView, AssetItem, FolderItem, SimpleItem
 from gui.progressDialog import ProgressDialog, BusyProgressDialog, MessageBox
@@ -16,6 +17,8 @@ from gui.mapDialog import MapTab
 from util.misc import openFile, getResPath, getUIPath
 from util.assetmanager import AssetManager
 from util.settings import SETTINGS
+from util.i18n import tr, translateUi, LANGUAGE, LANG_ZH_CN
+from gui.theme import applyTheme
 from parse.gameres import GameResDesc
 from parse.realres import GeomNodeTree, DynModel, RendInst, CollisionGeom
 from parse.material import DDSx
@@ -40,7 +43,7 @@ SHOULD_CACHE:tuple[type[Exportable]] = (
 	RendInst # for maps
 )
 
-DBLD_FILTER = ["Dagor Binary Level Data (*.bin)"]
+DBLD_FILTER = [tr("Dagor Binary Level Data") + " (*.bin)"]
 
 
 def handleCaching(asset:Exportable):
@@ -51,7 +54,7 @@ def handleCaching(asset:Exportable):
 			break
 
 def generateFileFilters():
-	filters = ["All supported files ("]
+	filters = [tr("All supported files") + " ("]
 
 	for cls in AssetManager.getOpenableClasses():
 		fformat = f"*.{cls.fileExtension}"
@@ -93,8 +96,11 @@ class MainWindow(QMainWindow):
 		super().__init__()
 		
 		loadUi(MAINWINDOWUI_PATH, self)
+		translateUi(self)
 
-		self.gridLayout.setContentsMargins(-1, -1, -1, -1)
+		self.gridLayout.setContentsMargins(10, 10, 10, 10)
+		self.setupToolBar()
+		self.setupStatusBar()
 		
 		self.treeView.initModel(self.lineEdit)
 
@@ -123,6 +129,42 @@ class MainWindow(QMainWindow):
 		
 		self.show()
 
+	def setupToolBar(self):
+		style = self.style()
+
+		self.actionOpenFolder.setIcon(style.standardIcon(QStyle.SP_DirOpenIcon))
+		self.actionOpenFiles.setIcon(style.standardIcon(QStyle.SP_FileIcon))
+		self.actionUnmount.setIcon(style.standardIcon(QStyle.SP_DialogDiscardButton))
+		self.actionExpand.setIcon(style.standardIcon(QStyle.SP_ArrowDown))
+		self.actionCollapse.setIcon(style.standardIcon(QStyle.SP_ArrowUp))
+		self.actionSettings.setIcon(style.standardIcon(QStyle.SP_FileDialogDetailedView))
+
+		toolBar = QToolBar(tr("Toolbar"), self)
+		toolBar.setObjectName("mainToolBar")
+		toolBar.setMovable(False)
+		toolBar.setIconSize(QSize(16, 16))
+		toolBar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+		toolBar.addAction(self.actionOpenFolder)
+		toolBar.addAction(self.actionOpenFiles)
+		toolBar.addSeparator()
+		toolBar.addAction(self.actionExpand)
+		toolBar.addAction(self.actionCollapse)
+		toolBar.addSeparator()
+		toolBar.addAction(self.actionUnmount)
+		toolBar.addAction(self.actionSettings)
+
+		self.addToolBar(Qt.TopToolBarArea, toolBar)
+		self.toolBar = toolBar
+
+	def setupStatusBar(self):
+		self.statusLabel = QLabel(tr("Ready"))
+		self.statusLabel.setProperty("muted", True)
+		self.statusBar().addWidget(self.statusLabel, 1)
+		self.statusBar().setSizeGripEnabled(True)
+
+		self.taskStatus.connect(self.statusLabel.setText)
+		self.requestedDialog.connect(lambda t: self.statusLabel.setText(tr("Ready")) if t == DIALOG_NONE else None)
+
 	def openSettings(self):
 		settings = SettingsDialog(self)
 		settings.exec_()
@@ -149,7 +191,7 @@ class MainWindow(QMainWindow):
 		return self.cachedIcons[icon]
 
 	def openFolder(self):
-		dialog = openFile(title = "Open asset folder", fileMode = QFileDialog.DirectoryOnly)
+		dialog = openFile(title = tr("Open asset folder"), fileMode = QFileDialog.DirectoryOnly)
 
 		if dialog is None:
 			return
@@ -158,7 +200,7 @@ class MainWindow(QMainWindow):
 	
 	
 	def openAssets(self):
-		dialog = openFile(title = "Open assets", nameFilters = self.__FILE_FILTERS)
+		dialog = openFile(title = tr("Open assets"), nameFilters = self.__FILE_FILTERS)
 
 		if dialog is None:
 			return
@@ -166,7 +208,7 @@ class MainWindow(QMainWindow):
 		self.mountAssets(dialog.selectedFiles())
 	
 	def openLevelFile(self, enlisted:bool):
-		dialog = openFile(title = "Open level file", nameFilters = DBLD_FILTER, fileMode = QFileDialog.ExistingFile)
+		dialog = openFile(title = tr("Open level file"), nameFilters = DBLD_FILTER, fileMode = QFileDialog.ExistingFile)
 
 		if dialog is None:
 			return
@@ -199,14 +241,14 @@ class MainWindow(QMainWindow):
 	def __mountAssetsInternal__(self, paths:list[str]):
 		self.setRequestedDialog(DIALOG_STATUS)
 		
-		self.setTaskTitle("Mounting assets")
-		self.setTaskStatus("Loading files...")
+		self.setTaskTitle(tr("Mounting assets"))
+		self.setTaskStatus(tr("Loading files..."))
 	
 		for p in paths:
 			self.exploreFileInfo(QFileInfo(p), self.treeView.treeModel)
 
 		if SETTINGS.getValue(SETTINGS_EXPAND_ALL):
-			self.setTaskStatus("Expanding items...")
+			self.setTaskStatus(tr("Expanding items..."))
 			self.itemsCreated.emit()
 		
 		self.setRequestedDialog(DIALOG_NONE)
@@ -251,7 +293,7 @@ class MainWindow(QMainWindow):
 			isDesc = absFilePath[-8:] == "Desc.bin"
 			
 			if isDesc or AssetManager.isOpenable(suffix):
-				self.setTaskStatus(f"Loading {absFilePath}")
+				self.setTaskStatus(tr("Loading {path}", path = absFilePath))
 				success = False
 
 				log.log(f"Found {absFilePath}")
@@ -389,15 +431,15 @@ class MapLoadThread(QRunnable):
 		
 		mainWindow.setRequestedDialog(DIALOG_STATUS)
 		
-		mainWindow.setTaskTitle("Loading map...")
-		mainWindow.setTaskStatus("Loading map data...")
+		mainWindow.setTaskTitle(tr("Loading map..."))
+		mainWindow.setTaskStatus(tr("Loading map data..."))
 
 		try:
 			mainWindow.setTerminable(map)
 
 			map.computeData()
 
-			mainWindow.setTaskStatus("Loading cell entities...")
+			mainWindow.setTaskStatus(tr("Loading cell entities..."))
 
 			riGen = map.riGenLayers[0]
 
@@ -447,22 +489,22 @@ class MapExportThread(QRunnable):
 		
 		mainWindow.setRequestedDialog(DIALOG_STATUS)
 		
-		mainWindow.setTaskTitle("Loading map...")
-		mainWindow.setTaskStatus("Loading map data...")
+		mainWindow.setTaskTitle(tr("Loading map..."))
+		mainWindow.setTaskStatus(tr("Loading map data..."))
 
 		try:
-			mainWindow.setTaskStatus("Loading cell entities")
+			mainWindow.setTaskStatus(tr("Loading cell entities..."))
 			mainWindow.setTaskProgress(0/3)
 			mainWindow.setTerminable(mapTab.map.riGenLayers[0])
 			entities = mapTab.getEntities()
 			mainWindow.clearTerminable()
 			mainWindow.setTaskProgress(1/3)
-			mainWindow.setTaskStatus("Writing DPL")
+			mainWindow.setTaskStatus(tr("Writing DPL"))
 			mapTab.writeToFile(output, entities)
 			mainWindow.setTaskProgress(2/3)
 			
 			if mapTab.exportAssets.isChecked():
-				mainWindow.setTaskStatus("Exporting assets")
+				mainWindow.setTaskStatus(tr("Exporting assets"))
 				mapTab.exportAssetsFunc(output, entities)
 			
 			mainWindow.setTaskProgress(1.0)
@@ -483,6 +525,15 @@ class MapExportThread(QRunnable):
 class App(QApplication):
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
+
+		self.setApplicationName("Dagor Asset Explorer")
+		applyTheme(self, SETTINGS.getValue(SETTINGS_THEME), LANGUAGE == LANG_ZH_CN)
+
+		if LANGUAGE == LANG_ZH_CN: # translate Qt's built-in dialogs and buttons
+			self.qtTranslator = QTranslator(self)
+
+			if self.qtTranslator.load("qt_zh_CN", QLibraryInfo.location(QLibraryInfo.TranslationsPath)):
+				self.installTranslator(self.qtTranslator)
 		
 		window = MainWindow()
 		
@@ -509,7 +560,7 @@ class App(QApplication):
 			elif dialogType == DIALOG_STATUS:
 				self.progressDialog = BusyProgressDialog(self.window)
 			elif dialogType == DIALOG_ERROR:
-				box = MessageBox("An error occured during the process. Check the console for details.")
+				box = MessageBox(tr("An error occured during the process. Check the console for details."))
 				box.exec_()
 
 	def handleDialogTitle(self, txt:str):

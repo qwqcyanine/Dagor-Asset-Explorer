@@ -3,8 +3,9 @@ from os import path
 
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
-from PyQt5 import QtWidgets, QtGui, uic
+from PyQt5 import QtWidgets, QtGui, QtCore, uic
 from util.misc import getResPath, getUIPath
+from util.i18n import tr, translateUi
 from winsound import PlaySound, SND_ALIAS, SND_ASYNC
 
 PROGRESSDIALOG_UI_PATH = getUIPath("progressDialog.ui")
@@ -21,7 +22,7 @@ class MessageBox(QtWidgets.QMessageBox):
 
 		self.setIcon(QtWidgets.QMessageBox.Icon.Critical)
 		self.setIconPixmap(QtGui.QPixmap(ERROR_ICO_PATH))
-		self.setWindowTitle("Unfunny!")
+		self.setWindowTitle(tr("Unfunny!"))
 		self.setText(text)
 		self.setStandardButtons(QtWidgets.QMessageBox.Ok)
 
@@ -39,6 +40,9 @@ class ProgressDialog(QtWidgets.QDialog):
 		self.mainWindow = mainWindow
 
 		uic.loadUi(PROGRESSDIALOG_UI_PATH, self)
+		translateUi(self)
+
+		self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowContextHelpButtonHint)
 
 		# self.setWindowTitle(title)
 		

@@ -17,6 +17,7 @@ from parse.dbld import DagorBinaryLevelData
 from parse.realres import RendInst, DynModel
 from util.enums import *
 from util.settings import SETTINGS
+from util.i18n import tr, translateUi
 from util.assetcacher import AssetCacher
 from struct import pack
 
@@ -103,7 +104,7 @@ def getOutputDir():
 
 		output = makeOutputFolder(output, True, "output")
 	else:
-		dialog = openFile(title = "Save to", fileMode = QFileDialog.DirectoryOnly)
+		dialog = openFile(title = tr("Save to"), fileMode = QFileDialog.DirectoryOnly)
 
 		if dialog == None:
 			return None
@@ -129,6 +130,11 @@ class MapTab(QWidget):
 		super().__init__(*args, **kwargs)
 		
 		loadUi(MAPUI_PATH, self)
+		translateUi(self)
+
+		self.exportButton.setProperty("primary", True)
+		self.infoLabel.setProperty("muted", True)
+		self.gridLayout.setSpacing(6)
 		
 		self.browse.setAcceptDrops(True)
 		self.browse.clicked.connect(self.openMap)
@@ -224,7 +230,7 @@ class MapTab(QWidget):
 
 				if checkable:
 					cellIdx = data[0]
-					text = f"\n{data[4]} unique models\n{data[2]} props\n{data[3]} vegetation"
+					text = "\n" + tr("{models} unique models\n{props} props\n{veg} vegetation", models = data[4], props = data[2], veg = data[3])
 
 					totalNonVegCnt += data[2]
 					totalVegCnt += data[3]
@@ -246,11 +252,11 @@ class MapTab(QWidget):
 		cellWidth = int(abs(cellSz  / layer.calculatedScale[2]))
 		
 		self.infoLabel.setText(" | ".join((
-			f"Total cell count: {layer.cellCnt}",
-			f"Exportable cells count: {len(layer.riDataRel)}",
-			f"Cell size: {cellLength}x{cellWidth}",
-			f"Total prop count: {totalNonVegCnt}",
-			f"Total vegetation count: {totalVegCnt}"
+			tr("Total cell count: {count}", count = layer.cellCnt),
+			tr("Exportable cells count: {count}", count = len(layer.riDataRel)),
+			tr("Cell size: {width}x{height}", width = cellLength, height = cellWidth),
+			tr("Total prop count: {count}", count = totalNonVegCnt),
+			tr("Total vegetation count: {count}", count = totalVegCnt)
 			# f"Total entity count: {totalVegCnt}",
 		)))
 

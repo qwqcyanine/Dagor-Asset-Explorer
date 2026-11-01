@@ -3,6 +3,8 @@ from os import path, getcwd, mkdir, makedirs
 
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
+from util.classproperty import classproperty
+
 import util.log as log
 from util.fileread import *
 from util.terminable import Packed, Pack, SafeIter, SafeRange, SafeEnumerate, SafeReversed, Terminable
@@ -147,18 +149,15 @@ class DDSx(Packed):
 		b"BC7 "
 	)
 
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self) -> str:
 		return "asset_tex.bmp"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls) -> str:
 		return "DDSx"
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "ddsx"
 	
@@ -350,18 +349,15 @@ class DDSx(Packed):
 		log.subLevel()
 
 class DDSxTexturePack2(Pack): # TODO: Add logs
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self) -> str:
 		return "folder_dxp.bmp"
 
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls) -> str:
 		return "DDSx Texture Pack"
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(cls) -> str:
 		return "dxp.bin"
 	

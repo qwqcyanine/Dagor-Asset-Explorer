@@ -3,6 +3,8 @@ from os import path, getcwd
 
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
+from util.classproperty import classproperty
+
 import util.log as log
 from util.fileread import *
 from util.enums import *
@@ -139,18 +141,15 @@ class GameResDesc(FilePathable, Terminable):
 		
 
 class GameResourcePack(Pack): # may need cleanup / TODO: rewrite like DXP2
-	@classmethod
-	@property
+	@classproperty
 	def classNiceName(cls):
 		return "Game Resource Pack"
 	
-	@classmethod
-	@property
+	@classproperty
 	def classIconName(self) -> str:
 		return "folder_packed.bmp"
 	
-	@classmethod
-	@property
+	@classproperty
 	def fileExtension(self) -> str:
 		return "grp"
 	

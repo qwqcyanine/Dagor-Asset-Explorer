@@ -4,6 +4,8 @@ from os import path, getcwd, stat
 
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
+from util.classproperty import classproperty
+
 import util.log as log
 from PyQt5.QtCore import QObject
 from abc import ABC, abstractmethod
@@ -183,8 +185,7 @@ class Exportable(Terminable, FilePathable, ABC):
 	def valid(self):
 		return self.__isValid
 	
-	@classmethod
-	@property
+	@classproperty
 	@abstractmethod
 	def classIconName(self) -> str:
 		...
@@ -193,14 +194,12 @@ class Exportable(Terminable, FilePathable, ABC):
 	def iconName(self):
 		return self.classIconName
 
-	@classmethod
-	@property
+	@classproperty
 	@abstractmethod
 	def classNiceName(cls) -> str:
 		...
 	
-	@classmethod
-	@property
+	@classproperty
 	@abstractmethod
 	def fileExtension(cls) -> str:
 		...

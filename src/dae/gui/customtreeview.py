@@ -3,11 +3,13 @@ from os import path, system, mkdir, makedirs, replace, listdir, rmdir
 
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
+from util.classproperty import classproperty
+
 import shutil
 import util.log as log
 from PyQt5.QtWidgets import QAbstractItemView, QTreeView, QLineEdit, QHeaderView, QMenu, QAction, QStyledItemDelegate, QFileDialog, QMainWindow
-from PyQt5.QtCore import QMimeData, Qt, QSortFilterProxyModel, QPoint, QFileInfo
-from PyQt5.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QStandardItemModel, QStandardItem, QIcon, QPaintEvent, QPainter
+from PyQt5.QtCore import QMimeData, Qt, QSortFilterProxyModel, QPoint, QFileInfo, QSize
+from PyQt5.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QStandardItemModel, QStandardItem, QIcon, QPaintEvent, QPainter, QPalette
 from util.misc import formatBytes, getResPath, openFile, ROOT_FOLDER, LIB_FOLDER
 from util.terminable import Exportable, Packed, Pack, Terminable
 from util.enums import *
@@ -19,6 +21,7 @@ from parse.gameres import GameResourcePack
 from traceback import format_exc
 from gui.progressDialog import MessageBox
 from util.settings import SETTINGS
+from util.i18n import tr
 from subprocess import Popen
 from glob import glob
 
@@ -94,7 +97,7 @@ class SimpleItem:
 						asset.computeData()
 
 						if asset.lodCount > 1:
-							submenu = menu.addMenu("Export LOD...")
+							submenu = menu.addMenu(tr("Export LOD..."))
 
 							for i in range(asset.lodCount):
 								submenu.addAction(ExportToDMF(menu, self, i))
@@ -114,7 +117,7 @@ class SimpleItem:
 
 					log.subLevel(log.curLevel - level)
 
-					MessageBox("Failed to compute preliminary data. Check the console for details.").exec_()
+					MessageBox(tr("Failed to compute preliminary data. Check the console for details.")).exec_()
 			elif isinstance(asset, Pack):
 				menu.addAction(ExtractAll(menu, self))
 
@@ -177,7 +180,7 @@ class AssetItem(SimpleItem):
 
 class FolderItem(SimpleItem):
 	__ICON = None
-	__TYPE = "Folder"
+	__TYPE = tr("Folder")
 
 	def __init__(self, mainWindow:QMainWindow, finfo:QFileInfo):
 		if not FolderItem.__ICON:
@@ -228,8 +231,7 @@ class ThreadedAction(CustomAction):
 	def taskTitle(self) -> str:
 		raise NotImplementedError()
 	
-	@classmethod
-	@property
+	@classproperty
 	def dialogType(self) -> int:
 		raise NotImplementedError()
 
@@ -314,12 +316,12 @@ class OpenFileLocation(CustomAction):
 	
 	@property
 	def actionText(self) -> str:
-		return "Open file location"
+		return tr("Open file location")
 
 class OpenParentFileLocation(OpenFileLocation):
 	@property
 	def actionText(self) -> str:
-		return "Open parent location"
+		return tr("Open parent location")
 	
 	
 	def run(self):
@@ -333,7 +335,7 @@ class CopyPathToClipboard(CustomAction):
 	
 	@property
 	def actionText(self) -> str:
-		return "Copy path to clipboard"
+		return tr("Copy path to clipboard")
 
 class CopyNameToClipboard(CustomAction):
 	item:AssetItem
@@ -343,7 +345,7 @@ class CopyNameToClipboard(CustomAction):
 	
 	@property
 	def actionText(self) -> str:
-		return "Copy name to clipboard"
+		return tr("Copy name to clipboard")
 
 
 
@@ -356,7 +358,7 @@ class SaveAction(ThreadedAction):
 
 			self.makeOutputFolder(True, "output")
 		else:
-			dialog = openFile(title = "Save to", fileMode = QFileDialog.DirectoryOnly)
+			dialog = openFile(title = tr("Save to"), fileMode = QFileDialog.DirectoryOnly)
 
 			if dialog == None:
 				return
@@ -368,8 +370,7 @@ class SaveAction(ThreadedAction):
 	def run(self):
 		self.save(self.output)
 	
-	@classmethod
-	@property
+	@classproperty
 	def dialogType(self) -> int:
 		return DIALOG_PROGRESS
 	
@@ -456,8 +457,7 @@ class PackedSave(AssetSaveAction):
 		
 		self.clearTerminable()
 	
-	@classmethod
-	@property
+	@classproperty
 	def hasFilter(cls):
 		return False
 
@@ -474,11 +474,11 @@ class PackedSave(AssetSaveAction):
 class Extract(AssetSaveAction):
 	@property
 	def actionText(self) -> str:
-		return "Extract"
+		return tr("Extract")
 	
 	@property
 	def taskTitle(self) -> str:
-		return f"Extracting {self.item.asset.name}.{self.item.asset.fileExtension}"
+		return tr("Extracting {file}", file = f"{self.item.asset.name}.{self.item.asset.fileExtension}")
 
 	def saveAsset(self, output:str, asset:Packed):
 		asset.save(output)
@@ -486,27 +486,27 @@ class Extract(AssetSaveAction):
 class ExtractAll(Extract, PackedSave):
 	@property
 	def actionText(self) -> str:
-		return "Extract all"
+		return tr("Extract all")
 	
 	@property
 	def taskTitle(self) -> str:
-		return f"Extracting files from {self.item.asset.name}.{self.item.asset.fileExtension}"
+		return tr("Extracting files from {file}", file = f"{self.item.asset.name}.{self.item.asset.fileExtension}")
 	
 	def makePackedOutputFolder(self, name:str):
 		return self.makeOutputFolder(SETTINGS.getValue(SETTINGS_EXTRACT_FOLDER), name)
 
 	def getProgressText(self, asset:Packed):
-		return f"Extracting {asset.name}.{asset.fileExtension}"
+		return tr("Extracting {file}", file = f"{asset.name}.{asset.fileExtension}")
 
 
 class ExportToDDS(Extract):
 	@property
 	def actionText(self) -> str:
-		return "Export to DDS"
+		return tr("Export to DDS")
 	
 	@property
 	def taskTitle(self) -> str:
-		return f"Exporting to {self.item.asset.name}.dds"
+		return tr("Exporting to {file}", file = f"{self.item.asset.name}.dds")
 
 	def saveAsset(self, output:str, asset:DDSx):
 		asset.exportDDS(output)
@@ -514,14 +514,14 @@ class ExportToDDS(Extract):
 class ExportAllToDDS(ExportToDDS, PackedSave):
 	@property
 	def actionText(self) -> str:
-		return "Export all to DDS"
+		return tr("Export all to DDS")
 	
 	@property
 	def taskTitle(self) -> str:
-		return f"Exporting files from {self.item.asset.name}.{self.item.asset.fileExtension} to DDS"
+		return tr("Exporting files from {file} to DDS", file = f"{self.item.asset.name}.{self.item.asset.fileExtension}")
 
 	def getProgressText(self, asset:Packed):
-		return f"Extracting {asset.name}.dds"
+		return tr("Extracting {file}", file = f"{asset.name}.dds")
 	
 
 class PreviewModel(CustomAction):
@@ -534,11 +534,11 @@ class PreviewModel(CustomAction):
 
 	@property
 	def actionText(self) -> str:
-		return f"Preview LOD {self.lod}"
+		return tr("Preview LOD {lod}", lod = self.lod)
 	
 	@property
 	def taskTitle(self) -> str:
-		return f"Previewing {self.item.asset.getExportName(self.lod)}.obj"
+		return tr("Previewing {file}", file = f"{self.item.asset.getExportName(self.lod)}.obj")
 
 	# def save(self):
 	# 	asset:RendInst = self.item.asset
@@ -564,11 +564,11 @@ class ExportToSource(SaveAction):
 	
 	@property
 	def actionText(self) -> str:
-		return f"Export LOD {self.lod} to Source engine"
+		return tr("Export LOD {lod} to Source engine", lod = self.lod)
 	
 	@property
 	def taskTitle(self) -> str:
-		return f"Exporting LOD {self.lod} to {self.item.asset.name}.mdl"
+		return tr("Exporting LOD {lod} to {file}", lod = self.lod, file = f"{self.item.asset.name}.mdl")
 
 	def save(self, output:str):
 		modelPath = "dae_out"
@@ -586,7 +586,7 @@ class ExportToSource(SaveAction):
 		else:
 			stepCnt = 3
 		
-		self.setTaskStatus("Generating model data")
+		self.setTaskStatus(tr("Generating model data"))
 
 		if self.handleTermination(asset):
 			return
@@ -597,7 +597,7 @@ class ExportToSource(SaveAction):
 		if self.handleTermination(smdl):
 			return
 		
-		self.setTaskStatus("Exporting model data to QC, SMD and VMT")
+		self.setTaskStatus(tr("Exporting model data to QC, SMD and VMT"))
 		qc, texturePaths = smdl.export(output, modelPath, exportCollisionModel, exportSMDs)
 		self.setTaskProgress(2/stepCnt)
 		self.clearTerminable()
@@ -616,7 +616,7 @@ class ExportToSource(SaveAction):
 			if self.shouldTerminate:
 				return
 			
-			self.setTaskStatus("Compiling")
+			self.setTaskStatus(tr("Compiling"))
 
 			pipes = Popen([
 				SETTINGS.getValue(SETTINGS_STUDIOMDL_PATH), 
@@ -653,7 +653,7 @@ class ExportToSource(SaveAction):
 		self.setTaskProgress(3/stepCnt)
 
 		if exportTex and texturePaths is not None:
-			self.setTaskStatus("Exporting textures")
+			self.setTaskStatus(tr("Exporting textures"))
 			log.addLevel()
 			mdl = smdl.model
 
@@ -668,7 +668,7 @@ class ExportToSource(SaveAction):
 				return
 
 			self.setTaskProgress(4/stepCnt)
-			self.setTaskStatus("Converting textures to VTF")
+			self.setTaskStatus(tr("Converting textures to VTF"))
 			log.addLevel()
 
 			materialsPath = path.join(sourceExport, "materials")
@@ -726,8 +726,7 @@ class ExportToSource(SaveAction):
 			log.subLevel()
 			self.setTaskProgress(5/stepCnt)
 
-	@classmethod
-	@property
+	@classproperty
 	def exportLODs(cls):
 		return False
 
@@ -739,14 +738,13 @@ class ExportLODsToSource(ExportToSource):
 
 	@property
 	def actionText(self) -> str:
-		return "Export all LODs to Source engine"
+		return tr("Export all LODs to Source engine")
 	
 	@property
 	def taskTitle(self) -> str:
-		return f"Exporting all LODs from {self.item.asset.name} to Source engine"
+		return tr("Exporting all LODs from {name} to Source engine", name = self.item.asset.name)
 
-	@classmethod
-	@property
+	@classproperty
 	def exportLODs(cls):
 		return True
 
@@ -769,30 +767,28 @@ class ExportModel(AssetSaveAction):
 	
 	@property
 	def actionText(self) -> str:
-		return f"Export LOD {self.lod} to {self.exportFormat.upper()}"
+		return tr("Export LOD {lod} to {format}", lod = self.lod, format = self.exportFormat.upper())
 	
 	@property
 	def taskTitle(self) -> str:
-		return f"Exporting LOD to {self.item.asset.getExportName(self.lod)}.{self.exportFormat}"
+		return tr("Exporting LOD to {file}", file = f"{self.item.asset.getExportName(self.lod)}.{self.exportFormat}")
 		
-	@classmethod
-	@property
+	@classproperty
 	def exportMethodName(cls) -> str:
 		raise NotImplementedError()
 	
-	@classmethod
-	@property
+	@classproperty
 	def exportFormat(cls) -> str:
 		raise NotImplementedError()
 
 class ExportLODs(PackedSave, ExportModel):
 	@property
 	def actionText(self) -> str:
-		return f"Export all LODs to {self.exportFormat.upper()}"
+		return tr("Export all LODs to {format}", format = self.exportFormat.upper())
 	
 	@property
 	def taskTitle(self) -> str:
-		return f"Exporting all LODs from {self.item.asset.name} to {self.exportFormat.upper()}"
+		return tr("Exporting all LODs from {name} to {format}", name = self.item.asset.name, format = self.exportFormat.upper())
 	
 	def save(self, output:str):
 		asset:RendInst = self.item.asset
@@ -815,11 +811,10 @@ class ExportLODs(PackedSave, ExportModel):
 		self.clearTerminable()
 
 	def getProgressText(self, asset:Packed):
-		return f"Exporting {asset.name}"
+		return tr("Exporting {name}", name = asset.name)
 
 class ExportAllModels(PackedSave, ExportModel):
-	@classmethod
-	@property
+	@classproperty
 	def hasFilter(cls):
 		return True
 
@@ -827,25 +822,23 @@ class ExportAllModels(PackedSave, ExportModel):
 		return isinstance(asset, RendInst)
 
 	def getProgressText(self, asset:RendInst):
-		return f"Exporting {asset.getExportName(0)}.{self.exportFormat}"
+		return tr("Exporting {name}", name = f"{asset.getExportName(0)}.{self.exportFormat}")
 
 	@property
 	def actionText(self) -> str:
-		return f"Export all models to LOD 0 {self.exportFormat.upper()}"
+		return tr("Export all models to LOD 0 {format}", format = self.exportFormat.upper())
 	
 	@property
 	def taskTitle(self) -> str:
-		return f"Exporting LOD 0 models from {self.item.asset.name}.{self.item.asset.fileExtension} to {self.exportFormat.upper()}"
+		return tr("Exporting LOD 0 models from {file} to {format}", file = f"{self.item.asset.name}.{self.item.asset.fileExtension}", format = self.exportFormat.upper())
 
 
 class ExportToDMF(ExportModel):
-	@classmethod
-	@property
+	@classproperty
 	def exportMethodName(cls) -> str:
 		return "exportDmf"
 
-	@classmethod
-	@property
+	@classproperty
 	def exportFormat(cls) -> str:
 		return "dmf"
 	
@@ -853,11 +846,11 @@ class ExportToDMF(ExportModel):
 class ExportSkeletonToDMF(ExportToDMF):
 	@property
 	def actionText(self):
-		return f"Export skeleton to {self.item.asset.name}.dmf"
+		return tr("Export skeleton to {file}", file = f"{self.item.asset.name}.dmf")
 	
 	@property
 	def taskTitle(self) -> str:
-		return f"Exporting skeleton to {self.item.asset.name}.{self.exportFormat}"
+		return tr("Exporting skeleton to {file}", file = f"{self.item.asset.name}.{self.exportFormat}")
 
 class ExportLODsToDMF(ExportToDMF, ExportLODs):
 	def __init__(self, *args, **kwargs):
@@ -868,13 +861,11 @@ class ExportAllToDMF(ExportToDMF, ExportAllModels):
 		super(ExportAllModels, self).__init__(*args, **kwargs)
 
 class ExportToOBJ(ExportModel):
-	@classmethod
-	@property
+	@classproperty
 	def exportMethodName(cls) -> str:
 		return "exportObj"
 
-	@classmethod
-	@property
+	@classproperty
 	def exportFormat(cls) -> str:
 		return "obj"
 
@@ -905,7 +896,7 @@ class FileSizeSortProxyModel(QSortFilterProxyModel):
 	
 
 class OptimizedModel(QStandardItemModel):
-	__HEADER_LABELS = ("Name", "Type", "Size")
+	__HEADER_LABELS = (tr("Name"), tr("Type"), tr("Size"))
 
 	def __init__(self, parent:QTreeView, lineEdit:QLineEdit):
 		super().__init__(parent)
@@ -941,6 +932,10 @@ class CustomTreeView(QTreeView):
 		self.setContextMenuPolicy(Qt.CustomContextMenu)
 		self.setAcceptDrops(True)
 		self.setDragEnabled(True)
+		self.setAlternatingRowColors(True)
+		self.setUniformRowHeights(True)
+		self.setAnimated(True)
+		self.setIconSize(QSize(16, 16))
 		self.mainWindow = None
 
 		self.customContextMenuRequested.connect(self.rightClickEvent)
@@ -950,7 +945,8 @@ class CustomTreeView(QTreeView):
 			super().paintEvent(event)
 		else:
 			painter = QPainter(self.viewport())
-			text = "Drag and drop files here or open assets through the \"File\" menu"
+			painter.setPen(self.palette().color(QPalette.PlaceholderText))
+			text = tr("Drag and drop files here or open assets through the \"File\" menu")
 			textRect = painter.fontMetrics().boundingRect(text)
 			textRect.moveCenter(self.viewport().rect().center())
 			painter.drawText(textRect, Qt.AlignCenter, text)
