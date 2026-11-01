@@ -159,6 +159,27 @@
         </layout>
        </item>
        <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_vtfcmd">
+         <item>
+          <widget class="QLineEdit" name="vtfCmdLine">
+           <property name="enabled">
+            <bool>false</bool>
+           </property>
+           <property name="placeholderText">
+            <string>path/to/VTFCmd.exe (default: lib/VTFcmd.exe)</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="vtfCmdBtn">
+           <property name="text">
+            <string>Browse...</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
         <layout class="QHBoxLayout" name="horizontalLayout_4">
          <item>
           <widget class="QLineEdit" name="gameInfoLine">

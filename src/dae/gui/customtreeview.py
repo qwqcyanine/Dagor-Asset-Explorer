@@ -16,7 +16,9 @@ from util.enums import *
 from pyperclip import copy as copyToClipboard
 from functools import partial
 from parse.material import DDSx, DDSxTexturePack2
-from parse.realres import RendInst, ModelContainer, GeomNodeTree
+from parse.realres import RendInst, DynModel, ModelContainer, GeomNodeTree
+from util.glide import GLIDE_KEEP_BONES, findTankBlk, writeAddon
+import re
 from parse.gameres import GameResourcePack
 from traceback import format_exc
 from gui.progressDialog import MessageBox
@@ -83,7 +85,6 @@ class SimpleItem:
 				level = log.curLevel
 
 				try:
-					# menu.addAction(PreviewModel(menu, self, 0))
 
 					if isinstance(asset, GeomNodeTree):
 						menu.addAction(ExportSkeletonToDMF(menu, self, 0))
@@ -91,13 +92,23 @@ class SimpleItem:
 						menu.addAction(ExportToDMF(menu, self, 0))
 					
 					if isinstance(asset, RendInst):
+						menu.addAction(PreviewModel(menu, self, 0))
 						menu.addAction(ExportToSource(menu, self, 0))
+
+						if isinstance(asset, DynModel):
+							menu.addAction(ExportToGlide(menu, self, 0))
+
 						menu.addAction(ExportToOBJ(menu, self, 0))
 
 						asset.computeData()
 
 						if asset.lodCount > 1:
 							submenu = menu.addMenu(tr("Export LOD..."))
+
+							for i in range(asset.lodCount):
+								submenu.addAction(PreviewModel(menu, self, i))
+
+							submenu.addSeparator()
 
 							for i in range(asset.lodCount):
 								submenu.addAction(ExportToDMF(menu, self, i))
@@ -538,21 +549,31 @@ class PreviewModel(CustomAction):
 	
 	@property
 	def taskTitle(self) -> str:
-		return tr("Previewing {file}", file = f"{self.item.asset.getExportName(self.lod)}.obj")
-
-	# def save(self):
-	# 	asset:RendInst = self.item.asset
-	# 	self.setTerminable(asset)
-		
-	# 	obj = asset.getObj(self.lod)
-
-	# 	self.setTaskProgress(1)
-	# 	self.clearTerminable()
+		return tr("Previewing {file}", file = self.item.asset.getExportName(self.lod))
 
 	def run(self):
-		asset:RendInst = self.item.asset
+		from gui.previewDialog import PreviewDialog, buildMeshParts
+		from PyQt5.QtWidgets import QApplication
 
-		# PreviewDialog(self.mainWindow, asset.getObj(self.lod)).show()
+		asset:RendInst = self.item.asset
+		level = log.curLevel
+
+		# shortcut: builds on the UI thread (UI freezes on huge models), move to ThreadedAction if that hurts
+		QApplication.setOverrideCursor(Qt.WaitCursor)
+
+		try:
+			parts = buildMeshParts(asset.getModel(self.lod))
+		except Exception:
+			print(format_exc())
+			log.subLevel(log.curLevel - level)
+			parts = None
+		finally:
+			QApplication.restoreOverrideCursor()
+
+		if parts is None:
+			MessageBox(tr("Failed to compute preliminary data. Check the console for details.")).exec_()
+		else:
+			PreviewDialog(self.mainWindow, self.taskTitle, parts).show()
 
 
 
@@ -570,16 +591,37 @@ class ExportToSource(SaveAction):
 	def taskTitle(self) -> str:
 		return tr("Exporting LOD {lod} to {file}", lod = self.lod, file = f"{self.item.asset.name}.mdl")
 
+	modelPath = "dae_out"
+	keepBones = None
+	forcedSettings = {}
+
+	def setting(self, key):
+		return self.forcedSettings.get(key, SETTINGS.getValue(key))
+
 	def save(self, output:str):
-		modelPath = "dae_out"
+		modelPath = self.modelPath
 		asset:RendInst = self.item.asset
-		exportTex = not SETTINGS.getValue(SETTINGS_NO_TEX_EXPORT)
-		exportToGame = SETTINGS.getValue(SETTINGS_EXPORT_GAMEINFO)
-		exportCollisionModel = SETTINGS.getValue(SETTINGS_STUDIOMDL_EXPORT_COLLISION)
-		exportSMDs = SETTINGS.getValue(SETTINGS_EXPORT_SMD)
-		dontCompile = SETTINGS.getValue(SETTINGS_NO_MDL)
+		exportTex = not self.setting(SETTINGS_NO_TEX_EXPORT)
+		exportToGame = self.setting(SETTINGS_EXPORT_GAMEINFO)
+		exportCollisionModel = self.setting(SETTINGS_STUDIOMDL_EXPORT_COLLISION)
+		exportSMDs = self.setting(SETTINGS_EXPORT_SMD)
+		dontCompile = self.setting(SETTINGS_NO_MDL)
 		dontReplaceTex = SETTINGS.getValue(SETTINGS_DONT_EXPORT_EXISTING_TEXTURES)
 		forceConvert = SETTINGS.getValue(SETTINGS_FORCE_DDS_CONVERSION)
+
+		compiler = SETTINGS.getValue(SETTINGS_STUDIOMDL_PATH)
+		gameInfo = SETTINGS.getValue(SETTINGS_GAMEINFO_PATH)
+		vtfCmd = SETTINGS.getValue(SETTINGS_VTFCMD_PATH) or VTFCMD_PATH
+		requiredPaths = []
+		if exportSMDs and not dontCompile:
+			requiredPaths.append(("StudioMDL", compiler))
+		if (exportSMDs and not dontCompile) or exportToGame:
+			requiredPaths.append(("gameinfo.txt", gameInfo))
+		if exportTex:
+			requiredPaths.append(("VTFCmd", vtfCmd))
+		for label, filePath in requiredPaths:
+			if not path.isfile(filePath):
+				raise ValueError(tr("Set a valid {tool} file in Settings before exporting. Current path: {path}", tool = label, path = repr(filePath)))
 
 		if exportTex:
 			stepCnt = 5
@@ -591,7 +633,8 @@ class ExportToSource(SaveAction):
 		if self.handleTermination(asset):
 			return
 		
-		smdl = asset.getSourceModel(self.lod, exportLODs = self.exportLODs)
+		smdl = asset.getSourceModel(self.lod, exportLODs = self.exportLODs, keepBones = self.keepBones)
+		self.smdl = smdl
 		self.setTaskProgress(1/stepCnt)
 		
 		if self.handleTermination(smdl):
@@ -605,7 +648,7 @@ class ExportToSource(SaveAction):
 		if self.shouldTerminate:
 			return
 		
-		gamePath = path.dirname(SETTINGS.getValue(SETTINGS_GAMEINFO_PATH))
+		gamePath = path.dirname(gameInfo)
 
 		output = path.join(output, smdl.name)
 		sourceExport = path.join(output, "source_export")
@@ -619,11 +662,11 @@ class ExportToSource(SaveAction):
 			self.setTaskStatus(tr("Compiling"))
 
 			pipes = Popen([
-				SETTINGS.getValue(SETTINGS_STUDIOMDL_PATH), 
+				compiler, 
 				"-nop4", 
 				"-verbose", 
 				"-game", 
-				path.dirname(SETTINGS.getValue(SETTINGS_GAMEINFO_PATH)), 
+				gamePath, 
 				qc])
 			
 			self.setSubProcess(pipes)
@@ -648,7 +691,7 @@ class ExportToSource(SaveAction):
 						return
 					
 					log.log(f"Moving {f} to {modelOutPath}")
-					replace(f, path.join(modelOutPath, path.basename(f)))
+					shutil.move(f, path.join(modelOutPath, path.basename(f)))
 			
 		self.setTaskProgress(3/stepCnt)
 
@@ -698,7 +741,7 @@ class ExportToSource(SaveAction):
 				makedirs(texOutPath, exist_ok = True)
 
 				pipes = Popen((
-					VTFCMD_PATH,
+					vtfCmd,
 					"-file",
 					path.normpath(texFile),
 					"-output",
@@ -729,6 +772,40 @@ class ExportToSource(SaveAction):
 	@classproperty
 	def exportLODs(cls):
 		return False
+
+class ExportToGlide(ExportToSource):
+	modelPath = "wt_glide"
+	keepBones = GLIDE_KEEP_BONES
+	forcedSettings = {SETTINGS_EXPORT_GAMEINFO: False, SETTINGS_STUDIOMDL_EXPORT_COLLISION: True, SETTINGS_EXPORT_SMD: True, SETTINGS_NO_MDL: False, SETTINGS_NO_TEX_EXPORT: False}
+
+	@property
+	def actionText(self) -> str:
+		return tr("Export to Gmod Glide addon")
+
+	@property
+	def taskTitle(self) -> str:
+		return tr("Exporting {file} to Gmod Glide", file = self.item.asset.name)
+
+	def save(self, output:str):
+		asset:DynModel = self.item.asset
+		super().save(output)
+
+		if self.shouldTerminate:
+			return
+
+		self.setTaskStatus(tr("Writing Glide addon"))
+		name = asset.name
+		className = "wt_" + re.sub(r"[^a-z0-9_]", "_", name.lower())
+		addonDir = path.join(path.dirname(SETTINGS.getValue(SETTINGS_GAMEINFO_PATH)), "addons", className)
+		blk = findTankBlk(asset.filePath, name)
+
+		if blk is None:
+			log.log(f"No War Thunder tank blk found for {name}, using default stats")
+
+		shutil.copytree(path.join(output, name, "source_export"), addonDir, dirs_exist_ok = True)
+		skeleton = self.smdl.model.skeleton
+		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk)
+		log.log(f"Glide addon written to {addonDir}")
 
 class ExportLODsToSource(ExportToSource):
 	def __init__(self, parent, item:SimpleItem):

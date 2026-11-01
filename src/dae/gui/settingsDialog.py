@@ -33,6 +33,8 @@ class SettingsDialog(QDialog):
 
 	studiomdlLine:QLineEdit
 	studioMdlBtn:QPushButton
+	vtfCmdLine:QLineEdit
+	vtfCmdBtn:QPushButton
 	gameInfoLine:QLineEdit
 	gameInfoBtn:QPushButton
 
@@ -80,7 +82,10 @@ class SettingsDialog(QDialog):
 
 
 		self.studiomdlLine.setText(SETTINGS.getValue(SETTINGS_STUDIOMDL_PATH))
-		self.studioMdlBtn.clicked.connect(lambda: self.selectFile(tr("Select StudioMDL binary"), ["studiomdl.exe"], SETTINGS_STUDIOMDL_PATH, self.studiomdlLine))
+		self.studioMdlBtn.clicked.connect(lambda: self.selectFile(tr("Select StudioMDL binary"), ["*.exe"], SETTINGS_STUDIOMDL_PATH, self.studiomdlLine))
+
+		self.vtfCmdLine.setText(SETTINGS.getValue(SETTINGS_VTFCMD_PATH))
+		self.vtfCmdBtn.clicked.connect(lambda: self.selectFile(tr("Select VTFCmd binary"), ["*.exe"], SETTINGS_VTFCMD_PATH, self.vtfCmdLine))
 
 		self.gameInfoLine.setText(SETTINGS.getValue(SETTINGS_GAMEINFO_PATH))
 		self.gameInfoBtn.clicked.connect(lambda: self.selectFile(tr("Select gameinfo.txt"), ["gameinfo.txt"], SETTINGS_GAMEINFO_PATH, self.gameInfoLine))

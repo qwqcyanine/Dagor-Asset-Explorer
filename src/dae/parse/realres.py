@@ -14,7 +14,7 @@ from util.enums import *
 from util.decompression import CompressedData, zlibDecompress
 from util.misc import getResPath, vectorTransform, matrixMul, matrixToEuler
 from util.assetcacher import AssetCacher
-from struct import unpack, pack
+from struct import unpack, pack, unpack_from, iter_unpack
 from parse.datablock import *
 from util.terminable import Packed, SafeRange, SafeIter, SafeEnumerate, Terminable
 from parse.mesh import MatVData, InstShaderMeshResource, ShaderMesh
@@ -328,8 +328,10 @@ class SMD(Terminable):
 		))
 
 class SourceModel(Terminable):
-	def __init__(self, name:str, model, collision = None, allLODs:tuple = None):
+	def __init__(self, name:str, model, collision = None, allLODs:tuple = None, keepBones:set[str] = None):
 		self.__name = name
+		self.__keepBones = keepBones # reduce the skeleton to these bones (+ ancestors), other meshes follow their nearest kept ancestor
+		self.__boneMap = None
 		self.__model:Model = model
 		self.__allLODs:tuple[Model] = allLODs
 		self.__collision:CollisionGeom = collision
@@ -415,7 +417,7 @@ class SourceModel(Terminable):
 		model:Model = model
 
 		self.setSubTask(model)
-		SMDs = model.getSMD(f"_lod{lodIdx}" if lodIdx > 0 else "")
+		SMDs = model.getSMD(f"_lod{lodIdx}" if lodIdx > 0 else "", boneMap = self.__boneMap)
 
 		smdNames:dict[str, list[str]] = {}
 
@@ -476,7 +478,7 @@ class SourceModel(Terminable):
 		outpath = path.join(outpath, "source_export")
 
 		if not path.exists(outpath):
-			mkdir(outpath)
+			makedirs(outpath)
 
 		log.log("Generating VMTs")
 		log.addLevel()
@@ -520,6 +522,9 @@ class SourceModel(Terminable):
 				"0 0 0 0 0 0 0",
 				"end"
 			))
+		elif self.__keepBones is not None:
+			kept, self.__boneMap = skeleton.getReducedBones(self.__keepBones)
+			skeSMD = skeleton.getReducedSMD(kept)
 		elif skeleton.nodeCount > MAX_SOURCE_BONES:
 			log.log(f"SMD only supports {MAX_SOURCE_BONES} bones! (current: {skeleton.nodeCount})", LOG_ERROR)
 
@@ -548,7 +553,7 @@ class SourceModel(Terminable):
 		outdir = path.join(outpath, "anims")
 		
 		if not path.exists(outdir):
-			mkdir(outdir)
+			makedirs(outdir)
 
 		log.log("Writing idle anim")
 
@@ -573,7 +578,7 @@ class SourceModel(Terminable):
 		outpath = path.join(outpath, self.name)
 
 		if not path.exists(outpath):
-			mkdir(outpath)
+			makedirs(outpath)
 
 		if not exportCollisionModel:
 			self.__collision = None
@@ -987,7 +992,7 @@ class Model(Terminable):
 		else:
 			return self.__skeleton.getDMF()
 
-	def getSMD(self, suffix:str = "", dontSplit:bool = False):
+	def getSMD(self, suffix:str = "", dontSplit:bool = False, boneMap:dict[int, int] = None):
 		log.log("Writing model SMD")
 		log.addLevel()
 
@@ -1059,7 +1064,9 @@ class Model(Terminable):
 						normals[f[2]]
 					)
 
-				if parentBone is not None and len(skeleton.getNodes()) <= MAX_SOURCE_BONES:
+				if parentBone is not None and boneMap is not None:
+					smd.setBone(boneMap[parentBone.idx])
+				elif parentBone is not None and len(skeleton.getNodes()) <= MAX_SOURCE_BONES:
 					smd.setBone(parentBone.idx)
 
 				smdFiles.append(smd)
@@ -1480,6 +1487,55 @@ class GeomNodeTree(RealResData, ModelContainer):
 	def getExportName(self, lodId:int):
 		return self.name
 
+	def getReducedBones(self, keepNames:set[str]):
+		"""Keep root, named nodes and their ancestors. Returns (kept nodes, {node idx: new bone idx of nearest kept ancestor})."""
+		nodes = self.getNodes()
+		keep = {0}
+
+		for node in nodes:
+			if node.name in keepNames:
+				while node is not None:
+					keep.add(node.idx)
+					node = node.parent
+
+		kept = [n for n in nodes if n.idx in keep]
+		newIdx = {n.idx:i for i, n in enumerate(kept)}
+		boneMap = {}
+
+		for node in nodes:
+			n = node
+
+			while n.idx not in newIdx:
+				n = n.parent
+
+			boneMap[node.idx] = newIdx[n.idx]
+
+		return kept, boneMap
+
+	def getReducedSMD(self, kept:list):
+		# rotation-free rest pose in the same mirrored world space Model.getSMD bakes verts into
+		pos = lambda n: (n.wtm[0][3] * VERTEX_SCALE, n.wtm[1][3] * VERTEX_SCALE, -n.wtm[2][3] * VERTEX_SCALE)
+		# ($upaxis Y rotates the root in the sequences: Source pos = (x, -z, y))
+		newIdx = {n.idx:i for i, n in enumerate(kept)}
+		skeSMD = ["nodes"]
+		posStr = ["skeleton", "time 0"]
+
+		for i, node in enumerate(kept):
+			p = pos(node)
+			parent = node.parent
+
+			if parent is not None:
+				pp = pos(parent)
+				p = (p[0] - pp[0], p[1] - pp[1], p[2] - pp[2])
+
+			skeSMD.append(f'{i} "{node.name if node.idx != 0 else "_ROOT"}" {newIdx[parent.idx] if parent is not None else -1}')
+			posStr.append(f"{i} {p[0]:.4f} {p[1]:.4f} {p[2]:.4f} 0 0 0")
+
+		skeSMD.append("end")
+		posStr.append("end")
+
+		return "\n".join(skeSMD + posStr)
+
 	def getSMD(self):
 		skeSMD = ["nodes"]
 
@@ -1832,13 +1888,13 @@ class RendInst(RealResData, ModelContainer):
 	def getExportName(self, lodId:int):
 		return f"{self.name}_{lodId}"
 
-	def getSourceModel(self, lodId:int = 0, exportLODs:bool = False):
+	def getSourceModel(self, lodId:int = 0, exportLODs:bool = False, keepBones:set[str] = None):
 		if exportLODs and self.lodCount > 1:
 			allLODs = tuple(self.getModel(i) for i in SafeRange(self, 1, self.lodCount))
 		else:
 			allLODs = None
 		
-		return SourceModel(self.name, self.getModel(lodId), self.collision, allLODs)
+		return SourceModel(self.name, self.getModel(lodId), self.collision, allLODs, keepBones)
 	
 
 		
@@ -2339,6 +2395,141 @@ class CollisionGeom(RealResData, ModelContainer):
 		def name(self):
 			return self.__name
 
+	class CollNodeV3:
+		def __init__(self, name:str, physMat:str, verts:tuple, faces:tuple):
+			self.name = name
+			self.physMat = physMat
+			self.__verts = verts
+			self.__faces = faces
+
+		def getVerts(self):
+			return self.__verts
+
+		def getFaces(self):
+			return self.__faces
+
+	@staticmethod
+	def parseStreamV3(d:bytes):
+		# collres stream v3 (DagorEngine collisionGameResLoad.cpp / collResStream.h / daBVH bvhIO.cpp)
+		def sx(v, bits = 13):
+			v &= (1 << bits) - 1
+			return v - (1 << bits) if v >> (bits - 1) else v
+
+		counts = unpack_from("<11I", d, 64)
+		N = counts[0]
+		ofs = 108 + N * 8 # header + bind records
+		recs = [unpack_from("<IIHhHHHBB7f", d, ofs + i * 48) for i in range(N)]
+		ofs += N * 48
+		tms = [unpack_from("<12f", d, ofs + i * 48) for i in range(counts[1])]
+		ofs += (counts[1] + counts[2] + counts[3]) * 48
+
+		geoms = {}
+
+		for i, r in enumerate(recs):
+			if not r[1]:
+				continue
+			
+			frame = unpack_from("<9f", d, ofs)
+			invScale, bmin = frame[3:6], frame[6:9]
+			magic, ver, stride, leafSize, treeBytes, vCnt = unpack_from("<IHBBII", d, ofs + 36)
+			ofs += 36 + 40
+
+			if magic != 0x694c4264 or stride != 8 or leafSize != 28:
+				raise Exception(f"Bad BLAS header in collision node {i}")
+
+			ioFlags = 0
+
+			if ver >= 2:
+				ioFlags = unpack_from("<I", d, ofs)[0]
+				ofs += 4
+			
+			verts = []
+
+			for (q,) in iter_unpack("<Q", d[ofs:ofs + vCnt * 8]):
+				verts.append((
+					(q & 0x1FFFFF) / 32 * invScale[0] + bmin[0],
+					((q >> 21) & 0x1FFFFF) / 32 * invScale[1] + bmin[1],
+					(q >> 42) / 32 * invScale[2] + bmin[2]))
+			
+			ofs += vCnt * 8
+
+			faces = []
+			leafCnt = 0
+			rt = 0 # runtime tree bytes consumed, the forest ends at treeBytes
+
+			def node():
+				nonlocal ofs, rt, leafCnt
+				cc = d[ofs]
+				ofs += 1
+
+				if cc in (0, 0xFF, 0xFE, 0xFD):
+					if cc in (0xFE, 0xFD):
+						w0, w1 = unpack_from("<II", d, ofs)
+						w2, w3 = (1 << 29) if cc == 0xFD else 0, 0
+						ofs += 8
+					else:
+						w0, w1, w2, w3 = unpack_from("<4I", d, ofs)
+						ofs += 16
+					
+					rt += 28
+					leafCnt += 1
+
+					if cc == 0xFF: # no-hit leaf
+						return
+					
+					b = w1 & 0xFFFFFF
+					o1, o2 = sx(w0), sx(w0 >> 13)
+					o3 = sx(((w0 >> 26) & 0x1F) | ((w1 >> 24) << 5))
+					o1b, o2b, o3b = sx(w2 >> 16), sx(w3), sx(w3 >> 13)
+					faces.append((b, b + o1, b + o2))
+
+					if o3 != o2:
+						faces.append((b + o2, b + o1, b + o3) if w2 & (1 << 29) else (b + o1, b + o2, b + o3))
+					
+					if o1b != o2b:
+						b += w2 & 0xFFFF
+						faces.append((b, b + o1b, b + o2b))
+
+						if o3b != o2b:
+							faces.append((b + o2b, b + o1b, b + o3b) if w2 & (1 << 30) else (b + o1b, b + o2b, b + o3b))
+				else:
+					rt += 16
+
+					for _ in range(cc):
+						node()
+
+			while rt < treeBytes:
+				node()
+			
+			if ioFlags & 1:
+				ofs += leafCnt * 2
+			
+			if len(faces) * 3 != r[1]:
+				raise Exception(f"Collision node {i}: decoded {len(faces)} faces, expected {r[1] // 3}")
+
+			geoms[i] = (verts, faces)
+		
+		ofs += counts[6] * 2 + counts[7] * 28 + counts[8] * 16 # phys mat pool, capsules, convex planes
+		names = d[ofs:ofs + counts[9]]
+		ofs += counts[9]
+		matNames = d[ofs:ofs + counts[10]].split(b"\0")
+
+		nodes = []
+
+		for i, (verts, faces) in geoms.items():
+			r = recs[i]
+			name = names[r[0]:names.index(b"\0", r[0])].decode() if counts[9] else f"node{i}"
+			physMat = matNames[r[3]].decode() if 0 <= r[3] < len(matNames) else None
+			tm = tms[i]
+			# TMatrix columns: x, y, z axes then translation; output stays in Dagor space like the render meshes
+			verts = tuple((
+				tm[0] * x + tm[3] * y + tm[6] * z + tm[9],
+				tm[1] * x + tm[4] * y + tm[7] * z + tm[10],
+				tm[2] * x + tm[5] * y + tm[8] * z + tm[11]) for x, y, z in verts)
+			nodes.append(CollisionGeom.CollNodeV3(name, physMat, verts, tuple(faces)))
+		
+		return tuple(nodes)
+
 	def __readFile__(self):
 		if self.__nodes is not None:
 			return
@@ -2346,6 +2537,12 @@ class CollisionGeom(RealResData, ModelContainer):
 		file = self.getBin()
 
 		magic = readInt(file)
+
+		if magic & 0xFFFF0000 == self.classId and magic & 0xFFFF == 3:
+			# shortcut: CompressedData reads a 24-bit block size, fine below 16 MB of compressed collision
+			self.__nodes = CollisionGeom.parseStreamV3(CompressedData(file).decompress())
+
+			return
 
 		if magic != self.classId:
 			raise Exception(f"Invalid magic: {magic}")
