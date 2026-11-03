@@ -7,7 +7,7 @@ from util.classproperty import classproperty
 
 import shutil
 import util.log as log
-from PyQt5.QtWidgets import QAbstractItemView, QTreeView, QLineEdit, QHeaderView, QMenu, QAction, QStyledItemDelegate, QFileDialog, QMainWindow
+from PyQt5.QtWidgets import QAbstractItemView, QTreeView, QLineEdit, QHeaderView, QMenu, QAction, QStyledItemDelegate, QFileDialog, QMainWindow, QDialog
 from PyQt5.QtCore import QMimeData, Qt, QSortFilterProxyModel, QPoint, QFileInfo, QSize
 from PyQt5.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QStandardItemModel, QStandardItem, QIcon, QPaintEvent, QPainter, QPalette
 from util.misc import formatBytes, getResPath, openFile, ROOT_FOLDER, LIB_FOLDER
@@ -17,7 +17,8 @@ from pyperclip import copy as copyToClipboard
 from functools import partial
 from parse.material import DDSx, DDSxTexturePack2
 from parse.realres import RendInst, DynModel, ModelContainer, GeomNodeTree
-from util.glide import GLIDE_KEEP_BONES, findTankBlk, writeAddon
+from gui.glideOptionsDialog import GlideOptionsDialog
+from util.glide import GLIDE_KEEP_BONES, TRACK_R_SUFFIX, defaultOptions, findGameRoot, findTankBlk, glideCollisionNodes, hiddenNodes, splitTrackMaterials, writeAddon
 import re
 from parse.gameres import GameResourcePack
 from traceback import format_exc
@@ -598,6 +599,9 @@ class ExportToSource(SaveAction):
 	def setting(self, key):
 		return self.forcedSettings.get(key, SETTINGS.getValue(key))
 
+	def prepareSourceModel(self, smdl):
+		pass
+
 	def save(self, output:str):
 		modelPath = self.modelPath
 		asset:RendInst = self.item.asset
@@ -635,6 +639,7 @@ class ExportToSource(SaveAction):
 		
 		smdl = asset.getSourceModel(self.lod, exportLODs = self.exportLODs, keepBones = self.keepBones)
 		self.smdl = smdl
+		self.prepareSourceModel(smdl)
 		self.setTaskProgress(1/stepCnt)
 		
 		if self.handleTermination(smdl):
@@ -786,6 +791,23 @@ class ExportToGlide(ExportToSource):
 	def taskTitle(self) -> str:
 		return tr("Exporting {file} to Gmod Glide", file = self.item.asset.name)
 
+	def preRun(self):
+		asset:DynModel = self.item.asset
+		self.blk = findTankBlk(asset.filePath, asset.name)
+		dialog = GlideOptionsDialog(self.mainWindow, defaultOptions(self.blk))
+
+		if dialog.exec_() != QDialog.Accepted:
+			return False
+
+		self.options = dialog.options()
+
+		return super().preRun()
+
+	def prepareSourceModel(self, smdl):
+		smdl.collisionNodeFilter = glideCollisionNodes
+		smdl.model.removeObjects(hiddenNodes(self.blk, self.options["upgraded"]))
+		self.tracks = splitTrackMaterials(smdl.model)
+
 	def save(self, output:str):
 		asset:DynModel = self.item.asset
 		super().save(output)
@@ -797,14 +819,24 @@ class ExportToGlide(ExportToSource):
 		name = asset.name
 		className = "wt_" + re.sub(r"[^a-z0-9_]", "_", name.lower())
 		addonDir = path.join(path.dirname(SETTINGS.getValue(SETTINGS_GAMEINFO_PATH)), "addons", className)
-		blk = findTankBlk(asset.filePath, name)
+		blk = self.blk
 
 		if blk is None:
 			log.log(f"No War Thunder tank blk found for {name}, using default stats")
 
 		shutil.copytree(path.join(output, name, "source_export"), addonDir, dirs_exist_ok = True)
+		matDir = path.join(addonDir, self.smdl.getMaterialsDir(self.modelPath))
+
+		# right track meshes got their own material copy so both sides can scroll independently
+		for mat in self.tracks["r"][0]:
+			src = path.join(matDir, mat[:-len(TRACK_R_SUFFIX)] + ".vmt")
+
+			if mat.endswith(TRACK_R_SUFFIX) and path.isfile(src):
+				shutil.copyfile(src, path.join(matDir, mat + ".vmt"))
+
 		skeleton = self.smdl.model.skeleton
-		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk)
+		self.setTaskStatus(tr("Extracting War Thunder sounds"))
+		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk, self.tracks, self.options, findGameRoot(asset.filePath))
 		log.log(f"Glide addon written to {addonDir}")
 
 class ExportLODsToSource(ExportToSource):

@@ -128,6 +128,38 @@ def normalize(normal):
 		normal[1] /= length
 		normal[2] /= length
 
+def bindNode(nodes:tuple, orgTm:tuple, tolerance:float = 1e-3):
+	"""Skeleton node whose bind position matches a skinned mesh bone's inverse bind matrix (rows: 3 axes, translation); the shallowest of coincident nodes"""
+	(a, b, c), (d, e, f), (g, h, i), t = orgTm
+	det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+
+	if abs(det) < 1e-9:
+		return None
+
+	# pos = -(R^T)^-1 t, R^T = columns of the rows above
+	rt = ((a, d, g), (b, e, h), (c, f, i))
+	pos = []
+
+	for k in range(3):
+		m = [list(r) for r in rt]
+
+		for r in range(3):
+			m[r][k] = -t[r]
+
+		pos.append((m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) / det)
+
+	def depth(n):
+		k = 0
+
+		while n.parent is not None:
+			n, k = n.parent, k + 1
+
+		return k
+
+	close = [n for n in nodes if sum((n.wtm[k][3] - pos[k]) ** 2 for k in range(3)) < tolerance ** 2]
+
+	return min(close, key = depth) if close else None
+
 class SkinnedMesh(Terminable):
 	skinNodes:tuple[int]
 	mesh:tuple[ShaderMesh]
@@ -136,6 +168,7 @@ class SkinnedMesh(Terminable):
 		lod:DynModel.Lod
 
 		self.skinNodes = tuple(readInt(file) for _ in SafeRange(self, lod.skinCnt))
+		self.boneOrgTms = [] # per mesh: inverse bind matrix of each bone its vertices index
 		self.sizes = tuple(readLong(file) & 0xBFFFFFFF for _ in SafeRange(self, lod.skinCnt))
 		self.mesh = tuple(self.computeMesh(file.readBlock(v), lod, k) for k, v in SafeEnumerate(self, self.sizes))
 			
@@ -180,6 +213,8 @@ class SkinnedMesh(Terminable):
 			unpack("fff", file.read(0xC)),
 			unpack("fff", file.read(0xC))
 		) for _ in SafeRange(self, boneOrgTmCnt))
+
+		self.boneOrgTms.append(boneOrgTm)
 
 		log.subLevel()
 
@@ -263,6 +298,7 @@ class SMD(Terminable):
 			self.verts = verts
 			self.normals = ((0, 0, 0), (0, 0, 0), (0, 0, 0))
 			self.UVs = UVs
+			self.links = None # per vertex ((bone, weight), ...) overriding the SMD's single bone
 		
 		def getNormal(self):
 			return self.normal
@@ -271,7 +307,7 @@ class SMD(Terminable):
 			return "\n".join((
 				self.material,
 				*(
-					f"{boneIdx} {self.formatTuple(self.verts[i])} {self.formatTuple(self.normals[i])} {self.formatTuple(self.UVs[i])}"# {weight}"
+					f"{boneIdx} {self.formatTuple(self.verts[i])} {self.formatTuple(self.normals[i])} {self.formatTuple(self.UVs[i])}{self.formatLinks(i)}"
 					for i in range(3)
 				)
 			))
@@ -283,6 +319,12 @@ class SMD(Terminable):
 				vectorTransform(matrix, self.verts[2])
 			)
 		
+		def formatLinks(self, i:int):
+			if not self.links or not self.links[i]:
+				return ""
+
+			return f" {len(self.links[i])} " + " ".join(f"{b} {w:.6f}" for b, w in self.links[i])
+
 		def formatTuple(self, array:tuple[float]):
 			return " ".join(tuple(f"{v:.6f}" for v in array))
 	
@@ -332,6 +374,7 @@ class SourceModel(Terminable):
 		self.__name = name
 		self.__keepBones = keepBones # reduce the skeleton to these bones (+ ancestors), other meshes follow their nearest kept ancestor
 		self.__boneMap = None
+		self.collisionNodeFilter = None # callable(node names) -> names to keep in the collision model
 		self.__model:Model = model
 		self.__allLODs:tuple[Model] = allLODs
 		self.__collision:CollisionGeom = collision
@@ -433,7 +476,7 @@ class SourceModel(Terminable):
 
 		if self.__collision is not None and lodIdx == 0:
 			self.setSubTask(self.__collision)
-			colMdl = self.__collision.getModel(singleMesh = True)
+			colMdl = self.__collision.getModel(singleMesh = True, nodeFilter = self.collisionNodeFilter)
 			self.setSubTask(colMdl)
 			SMDs.append(colMdl.getSMD(dontSplit = True)[0])
 
@@ -688,6 +731,7 @@ class Model(Terminable):
 		self.__exportName = exportName
 
 		self.__objects:list[Model.Object] = []
+		self.skin:dict[int, tuple[tuple[int, float], ...]] = {} # vertex -> ((skeleton node idx, weight), ...) for skinned objects
 		self.__vertices:list[tuple[float, float, float]] = []
 		self.__uvs:list[tuple[float, float]] = []
 
@@ -719,6 +763,9 @@ class Model(Terminable):
 		else:
 			return self.__objects[key]
 	
+	def removeObjects(self, names:set[str]):
+		self.__objects = [o for o in self.__objects if o.name not in names]
+
 	def newObject(self, name:str, skinned:bool = False):
 		obj = self.Object(name, skinned)
 
@@ -735,6 +782,7 @@ class Model(Terminable):
 		log.addLevel()
 
 		self.appendVerts(mdl.__vertices, mdl.__uvs, scale = False)
+		self.skin.update((v + vOfs, links) for v, links in mdl.skin.items())
 		
 		log.log(f"Appended {len(mdl.__vertices)} vertices and UVs (offset = {vOfs})")
 
@@ -992,6 +1040,18 @@ class Model(Terminable):
 		else:
 			return self.__skeleton.getDMF()
 
+	@staticmethod
+	def __mapLinks(links, boneMap:dict[int, int]):
+		if not links:
+			return None
+
+		merged = {}
+
+		for b, w in links:
+			merged[boneMap[b]] = merged.get(boneMap[b], 0) + w
+
+		return tuple(merged.items())
+
 	def getSMD(self, suffix:str = "", dontSplit:bool = False, boneMap:dict[int, int] = None):
 		log.log("Writing model SMD")
 		log.addLevel()
@@ -1057,6 +1117,10 @@ class Model(Terminable):
 					)
 
 					tri = smd.newTriangle(curMat, verts, UVs)
+
+					# skinned (bind pose) verts keep their skeleton weights when bones are remapped to a reduced skeleton
+					if obj.skinned and boneMap is not None and any(v in self.skin for v in f):
+						tri.links = tuple(self.__mapLinks(self.skin.get(v), boneMap) for v in f)
 
 					tri.normals = (
 						normals[f[0]],
@@ -2216,7 +2280,30 @@ class DynModel(RendInst):
 
 		log.subLevel()
 
+		if self.geomNodeTree is not None:
+			self.__applySkin(mdl, skinnedMesh, vertexDatas)
+
 		return mdl
+
+	def __applySkin(self, mdl, skinnedMesh:SkinnedMesh, vertexDatas:list):
+		"""Per vertex skeleton weights (Model.skin) from the skinned vertex data's bone indices"""
+		rawSkin = {}
+
+		for vd in vertexDatas:
+			if vd is not None and vd[0].getSkin() is not None:
+				rawSkin.update((vd[1] + j, links) for j, links in enumerate(vd[0].getSkin()) if links)
+
+		nodes = self.geomNodeTree.getNodes()
+
+		for obj, orgTms in zip(mdl, skinnedMesh.boneOrgTms):
+			bones = [bindNode(nodes, tm) for tm in orgTms]
+
+			for f in obj.faces:
+				for v in f:
+					links = rawSkin.get(v)
+
+					if links and v not in mdl.skin and all(b < len(bones) and bones[b] is not None for b, _ in links):
+						mdl.skin[v] = tuple((bones[b].idx, w) for b, w in links)
 
 	def getModel(self, lodId:int):
 		self.computeData()
@@ -2599,7 +2686,7 @@ class CollisionGeom(RealResData, ModelContainer):
 			return assets[0]
 		
 	
-	def getModel(self, lodId:int = 0, singleMesh:bool = False):
+	def getModel(self, lodId:int = 0, singleMesh:bool = False, nodeFilter = None):
 		self.__readFile__()
 
 		# print(self.getSurfaceProp())
@@ -2607,12 +2694,16 @@ class CollisionGeom(RealResData, ModelContainer):
 		mdl = Model(self.name, skeleton = self.getSkeleton())
 		
 		vOfs = 0
+		keep = None if nodeFilter is None else nodeFilter([n.name for n in self.__nodes])
 
 		if singleMesh:
 			ob = mdl.newObject(self.name)
 
 		for node in SafeIter(self, self.__nodes):
 			node:CollisionGeom.CollNode
+
+			if keep is not None and node.name not in keep:
+				continue
 
 			if not singleMesh:
 				ob = mdl.newObject(node.name)

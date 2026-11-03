@@ -468,6 +468,7 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 			self.__verts:tuple[tuple(float, float, float)] = None
 			self.__UVs:tuple[tuple(float, float)] = None
 			self.__faces:tuple[tuple(int, int, int)] = None
+			self.__skin:list[tuple[bytes, bytes]] = None
 			self.__unimplemented = False
 
 			gvData:MatVData.GlobalVertexData = gvData
@@ -606,13 +607,36 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 			UVs:list[list[float, float]] = [None] * vCnt
 
 			parser = self.getParser(format, vStride)
+			# skinned vertex layouts: offset of the ubyte4 bone indices (ubyte4 weights follow); pos-first verts keep them at +16
+			skinOfs = self.SKIN_OFFSETS.get((format, vStride))
+			skin = [None] * vCnt if skinOfs is not None else None
 
 			if parser is None:
 				raise Exception(f"Unimplemented storage format {format}-{vStride}")
 			else:
 				log.log(f"Processing {vCnt} vertices vFormat={format} vStride={vStride}")
 
+				# one buffer can hold shaders with different channel orders: skinned verts put pos (short4, w=0x7fff) first, uv at +12
+				posFirst = (format, vStride) == (15, 24)
+
 				for i in SafeRange(self, vCnt):
+					if posFirst:
+						raw = file.read(vStride)
+
+						if raw[6:8] == b"\xff\x7f":
+							x, y, z, u, v = unpack("<3h6x2h", raw[:16])
+							verts[i] = [x / 32768, y / 32768, z / 32768]
+							UVs[i] = (u / 4096, 1 + (-v / 4096))
+							skin[i] = self.__readSkin(raw, 16)
+
+							continue
+
+						file.seek(-vStride, 1)
+
+					if skin is not None:
+						skin[i] = self.__readSkin(file.read(vStride), skinOfs)
+						file.seek(-vStride, 1)
+
 					for parseClass in SafeIter(self, parser):
 						parseClass:MatVData.VertexData.PARSECLASS
 
@@ -625,6 +649,23 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 
 			self.__verts = verts
 			self.__UVs = UVs
+			self.__skin = skin
+
+		SKIN_OFFSETS = {(15, 24):0, (16, 28):4}
+
+		@staticmethod
+		def __readSkin(raw:bytes, ofs:int):
+			"""((bone, weight 0..1), ...) from ubyte4 indices + ubyte4 weights, None if the bytes are not skin weights"""
+			idx, w = raw[ofs:ofs + 4], raw[ofs + 4:ofs + 8]
+
+			if sum(w) != 255:
+				return None
+
+			return tuple((idx[k], w[k] / 255) for k in range(4) if w[k])
+
+		def getSkin(self):
+			"""Per vertex ((bone index into the skinned mesh's bone table, weight), ...) or None; only meaningful for skinned vertex data"""
+			return self.__skin
 			
 		def __processFaces__(self, file:BinBlock):
 			if self.__unimplemented:
