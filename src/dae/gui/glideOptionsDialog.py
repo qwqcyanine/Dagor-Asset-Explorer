@@ -19,7 +19,10 @@ class GlideOptionsDialog(QDialog):
 		self.transmission.addItem(tr("Single differential (pivot on one track)"), True)
 		self.transmission.addItem(tr("Double differential (neutral steer)"), False)
 		self.transmission.setCurrentIndex(0 if options["singleFlow"] else 1)
-		form.addRow(tr("Transmission"), self.transmission)
+		self.wheeled = options.get("wheeled", False)
+
+		if not self.wheeled: # steers its axles, no track differential
+			form.addRow(tr("Transmission"), self.transmission)
 
 		self.armor = QComboBox()
 		self.armor.addItem(tr("Upgraded (all modifications researched)"), True)
@@ -48,4 +51,4 @@ class GlideOptionsDialog(QDialog):
 		form.addRow(buttons)
 
 	def options(self) -> dict:
-		return {"singleFlow": self.transmission.currentData(), "upgraded": self.armor.currentData(), **{k:s.value() for k, s in self.spins.items()}}
+		return {"singleFlow": self.transmission.currentData(), "wheeled": self.wheeled, "upgraded": self.armor.currentData(), **{k:s.value() for k, s in self.spins.items()}}

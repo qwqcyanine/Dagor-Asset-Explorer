@@ -5,6 +5,7 @@ from math import pi, sqrt
 from os import path, makedirs
 from statistics import median
 import util.log as log
+from util.enums import JET_PLUME_V
 from util.vromfs import VROMFS
 
 VERTEX_SCALE = 40 # same as parse.realres
@@ -44,7 +45,19 @@ def defaultOptions(blk:dict):
 		"maxFwdSpeed": float(blk.get("maxFwdSpeed", 60)),
 		"maxRevSpeed": float(blk.get("maxRevSpeed", 15)),
 		"upgraded": True,
+		"wheeled": isWheeled(blk),
 	}
+
+def isWheeled(blk:dict):
+	"""Wheeled vehicle (armoured car, wheeled tank destroyer) rather than a tracked tank"""
+	return (((blk or {}).get("VehiclePhys") or {}).get("mechanics") or {}).get("tracked") is False
+
+def steering(blk:dict):
+	"""{wheel mesh node: (bone it steers with, max deflection in degrees)} from the blk's suspension"""
+	susp = ((blk or {}).get("VehiclePhys") or {}).get("suspension") or {}
+	nodes = susp.get("steeringNodes") or {}
+
+	return {k: (str(nodes.get(k, "")), float(v)) for k, v in (susp.get("steeringDeflection") or {}).items() if k.startswith("wheel_") and float(v)}
 
 def hiddenNodes(blk:dict, upgraded:bool = True):
 	"""Model nodes War Thunder hides for this modification state. Both armor kits are in the model on top of each other,
@@ -123,6 +136,27 @@ def findGameRoot(assetPath:str):
 
 	return d
 
+def cacheHQTextures(gameRoot:str, textures:list[str]):
+	"""Cache the full resolution copies War Thunder keeps in content.hq; the export picks the largest cached DDSx per name."""
+	from glob import glob
+	from parse.material import DDSxTexturePack2
+	from util.assetcacher import AssetCacher
+
+	want = {t.split("*")[0] for t in textures or ()}
+	found = 0
+
+	for f in glob(path.join(gameRoot or "", "content.hq", "hq_tex", "res", "**", "*.dxp.bin"), recursive = True) if want else ():
+		try:
+			for tex in DDSxTexturePack2(f).getPackedFiles():
+				# re-exports would cache the same copy again
+				if tex.name in want and all(c.getPixelCnt() < tex.getPixelCnt() for c in AssetCacher.getCachedAsset(type(tex), tex.name) or ()):
+					AssetCacher.cacheAsset(tex)
+					found += 1
+		except Exception as e: # a broken pack only costs its textures
+			log.log(f"Skipping {f}: {e}")
+
+	return found
+
 def findTankBlk(assetPath:str, modelName:str):
 	"""Walk up from the asset file to the War Thunder root and read the tank blk whose model matches. Returns None if not found.
 	Each weapon also gets "weaponBlk" (its gamedata blk) when readable."""
@@ -198,8 +232,8 @@ def cannonReload(w:dict):
 	"""Seconds between cannon shots (blk shotFreq is per second, an aced crew / autoloader)"""
 	return 1 / max(float(w.get("weaponBlk", {}).get("shotFreq", 0.5)), 0.05)
 
-def soundEvents(blk:dict):
-	"""{role: FMOD event path} of a tank blk"""
+def soundEvents(blk:dict, soundConfig:dict = None):
+	"""{role: FMOD event path} of a tank blk, resolving engine aliases through WT's sound configuration."""
 	snd = (blk or {}).get("sound", {})
 	engine = str(snd.get("EngineName", ""))
 	engine = f"event:/ground/engines/{engine[len('engine_'):] if engine.startswith('engine_') else engine}"
@@ -211,6 +245,13 @@ def soundEvents(blk:dict):
 		"turret": f"event:/ground/effects/{snd.get('turret_turn')}",
 		"cannon": weaponEvent(firstWeapon(blk)),
 	}
+
+	cfg = (soundConfig or {}).get(snd.get("EngineName"), {})
+	for role, group, keys in (("engine", "outside", ("eventBack", "eventFront")), ("start", "effects", ("eventStart",)), ("stop", "effects", ("eventStop",))):
+		mapping = cfg.get(group, {})
+		name = next((mapping[k] for k in keys if mapping.get(k)), None)
+		if mapping.get("path") and name:
+			events[role] = f"event:/{mapping['path']}/{name}"
 
 	for role in ("coaxial", "machinegun"):
 		events[role] = weaponEvent(machineGun(blk, role))
@@ -228,7 +269,12 @@ def exportSounds(gameRoot:str, blk:dict, outDir:str):
 		return {}
 
 	guids = wtsound.readStrings(path.join(soundDir, "masterbank.strings.bank"))
-	events = soundEvents(blk)
+	try:
+		soundConfig = VROMFS(path.join(gameRoot, "aces.vromfs.bin")).readBlk("config/sound_studio.blk")
+	except (OSError, KeyError, ValueError) as e:
+		log.log(f"Ground engine sound configuration unavailable: {e}", 2)
+		soundConfig = {}
+	events = soundEvents(blk, soundConfig)
 	reloadEvent, reloadLength = reloadSfx(gameRoot, firstWeapon(blk)) if "cannon" in events else (None, 0.0)
 
 	if reloadEvent:
@@ -294,13 +340,14 @@ def exportSounds(gameRoot:str, blk:dict, outDir:str):
 	return roles
 
 def getWheels(skeleton):
-	"""Every road wheel, front to rear per side: [(name, pos, index on side, count on side)] left side first.
+	"""Every road wheel, front to rear per side: [(name, pos, index on side, count on side, node)] left side first.
 	All of them are physics wheels, so an obstacle under any road wheel lifts the hull."""
 	wheels = []
 
 	for side in "lr":
-		nodes = sorted((n for n in skeleton.getNodes() if re.fullmatch(f"bone_wheel_{side}_\\d+", n.name)), key = lambda n: -n.wtm[0][3])
-		wheels.extend((n.name, gamePos(n), i, len(nodes)) for i, n in enumerate(nodes))
+		# wheeled vehicles name trailing-arm wheels bone_wheel_l_back_03
+		nodes = sorted((n for n in skeleton.getNodes() if re.fullmatch(f"bone_wheel_{side}_(back_)?\\d+", n.name)), key = lambda n: -n.wtm[0][3])
+		wheels.extend((n.name, gamePos(n), i, len(nodes), n) for i, n in enumerate(nodes))
 
 	return wheels
 
@@ -323,23 +370,13 @@ def gearbox(blk:dict, options:dict):
 
 def spinBone(wheelBone):
 	"""Bone to spin for a bone_wheel_*: its wheel mesh node when kept (the track follows bone_wheel_* itself)"""
-	mesh = next((c for c in wheelBone.children if c.name == wheelBone.name[len("bone_"):]), None)
+	mesh = next((c for c in wheelBone.children if re.fullmatch("wheel_[lr]_\\d+", c.name)), None)
 
 	return mesh.name if mesh else wheelBone.name
 
-def suspensionBones(skeleton, wheels:list):
+def suspensionBones(wheels:list):
 	"""[(bone_suspension_* name, 1-based index of its road wheel in `wheels`)]"""
-	index = {w[0]: k + 1 for k, w in enumerate(wheels)}
-	result = []
-
-	for n in skeleton.getNodes():
-		if re.fullmatch("bone_suspension_[lr]_\\d+", n.name):
-			wheel = next((c for c in n.children if c.name in index), None)
-
-			if wheel:
-				result.append((n.name, index[wheel.name]))
-
-	return result
+	return [(w[4].parent.name, k + 1) for k, w in enumerate(wheels) if w[4].parent is not None and w[4].parent.name.startswith("bone_suspension_")]
 
 def isDescendant(n, ancestor):
 	while n is not None:
@@ -374,6 +411,9 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 	mass = min(float(options["mass"]), 50000)
 	massScale = mass / 20000 # base_glide_tank is tuned for its 20000 kg default
 	wheels = getWheels(skeleton)
+	wheeled = isWheeled(blk)
+	steer = steering(blk) if wheeled else {}
+	maxSteer = max((a for _, a in steer.values()), default = 30.0)
 	radius = max(wheels[0][1][2], 5) if wheels else 15
 	gears, revRatio, topForce, torqueRise = gearbox(blk, options)
 	top = gears[-1]
@@ -394,18 +434,27 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 	baseSpring = 6000 * massScale * perWheel
 	springDamper = 30000 * massScale * perWheel * sqrt(springStrength / baseSpring)
 	lift = BUMP_TRAVEL
-	allWheelBones = [spinBone(n) for n in skeleton.getNodes() if re.fullmatch("bone_wheel_[lr]_\\d+", n.name)]
-	suspension = suspensionBones(skeleton, wheels)
+	suspension = suspensionBones(wheels)
 	turretPos = gamePos(turret) if turret else (0, 0, 50)
 	seatPos = gamePos(driver) if driver else (0, 0, turretPos[2] * 0.5)
 
 	wheelLines = []
 
-	for name, p, i, cnt in wheels:
-		steer = 1 if i == 0 else (-1 if i == cnt - 1 else 0)
-		wheelLines.append(f"        self:CreateWheel( {vec((p[0], p[1], p[2] + lift))}, {{ radius = {max(p[2], 5):.1f}, steerMultiplier = {steer} }} ){':SetSoundsEnabled( false )' if steer == 0 else ''}")
-
 	firstRight = next((k + 1 for k, w in enumerate(wheels) if w[0].startswith("bone_wheel_r_")), 1)
+	wheelBoneLines = []
+
+	for k, (name, p, i, cnt, n) in enumerate(wheels):
+		spin = spinBone(n)
+		steerBone, angle = steer.get(spin, ("", 0.0))
+		# wheeled: War Thunder's per wheel deflection; tracked: Glide's skid steer pushes the end wheels sideways
+		mult = round(angle / maxSteer, 3) if wheeled else (1 if i == 0 else (-1 if i == cnt - 1 else 0))
+		wheelLines.append(f"        self:CreateWheel( {vec((p[0], p[1], p[2] + lift))}, {{ radius = {max(p[2], 5):.1f}, steerMultiplier = {mult} }} ){':SetSoundsEnabled( false )' if mult == 0 else ''}")
+		# a track rolls all its road wheels with its first one
+		drive = k + 1 if wheeled else (firstRight if name.startswith("bone_wheel_r_") else 1)
+		# steering a bone that also spins would turn the axle off the wheel
+		steerBone = steerBone or name
+		angle = angle if steerBone != spin else 0.0
+		wheelBoneLines.append(f'        {{ spin = "{spin}", steer = "{steerBone}", wheel = {drive}, angle = {angle:.1f} }},')
 	cdMaterials = modelPath[:-len(".mdl")]
 	trackLines = []
 
@@ -539,8 +588,15 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 			"        self:SetWTMachineGun( mg )",
 		]
 
-	leftBones = ", ".join(f'"{b}"' for b in allWheelBones if re.match("(bone_)?wheel_l_", b))
-	rightBones = ", ".join(f'"{b}"' for b in allWheelBones if re.match("(bone_)?wheel_r_", b))
+	rollingLines = [] if wheeled else [
+		"",
+		"        -- tracks: scale Glide's per surface rolling resistance up (also for surfaces it has no entry for)",
+		"        for id, r in pairs( self.surfaceResistance ) do",
+		f"            self.surfaceResistance[id] = r * {resistScale:.2f}",
+		"        end",
+		"",
+		f"        setmetatable( self.surfaceResistance, {{ __index = function() return {0.05 * resistScale:.3f} end }} )",
+	]
 	suspensionLines = [f'        {{ bone = "{name}", wheel = {k} }},' for name, k in suspension]
 	nl = "\n"
 
@@ -698,19 +754,16 @@ if CLIENT then
         end
     end
 
-    local LEFT_WHEELS = {{ {leftBones} }}
-    local RIGHT_WHEELS = {{ {rightBones} }}
+    -- spin: rolls with physics wheel `wheel`; steer: turns by `angle` degrees at full steering (War Thunder's deflection)
+    local WHEELS = {{
+{nl.join(wheelBoneLines)}
+    }}
 
     function ENT:OnActivateMisc()
-        self.leftWheelBones = {{}}
-        self.rightWheelBones = {{}}
+        self.wheelBones = {{}}
 
-        for _, name in ipairs( LEFT_WHEELS ) do
-            self.leftWheelBones[#self.leftWheelBones + 1] = self:LookupBone( name )
-        end
-
-        for _, name in ipairs( RIGHT_WHEELS ) do
-            self.rightWheelBones[#self.rightWheelBones + 1] = self:LookupBone( name )
+        for i, w in ipairs( WHEELS ) do
+            self.wheelBones[i] = {{ spin = self:LookupBone( w.spin ), steer = w.angle ~= 0 and self:LookupBone( w.steer ) or nil }}
         end
 
         self.suspensionBones = {{}}
@@ -723,11 +776,11 @@ if CLIENT then
         self.mgPitchBone = self:LookupBone( "{aaPitch.name if aaPitch else ""}" )
     end
 
-    local spinAng = Angle()
+    local spinAng, steerAng = Angle(), Angle()
     local mgAng = Angle()
 
     function ENT:OnUpdateAnimations()
-        if not self.leftWheelBones then return end
+        if not self.wheelBones then return end
 
         self.trackScroll = self.trackScroll or {{}}
         self.lastTrackSpin = self.lastTrackSpin or {{}}
@@ -742,17 +795,21 @@ if CLIENT then
 
         self:UpdateSuspension()
 
-        -- bones are Y-up (studiomdl $upaxis Y): rolling is around the bone's Z axis
-        spinAng[2] = self:GetWheelSpin( 1 )
+        -- bones are Y-up (studiomdl $upaxis Y): rolling is around the bone's Z axis, steering around its Y axis (pitch slot)
+        local steering = self:GetSteering()
 
-        for _, b in ipairs( self.leftWheelBones ) do
-            self:ManipulateBoneAngles( b, spinAng, false )
-        end
+        for i, w in ipairs( WHEELS ) do
+            local b = self.wheelBones[i]
 
-        spinAng[2] = self:GetWheelSpin( {firstRight} )
+            if b.spin then
+                spinAng[2] = self:GetWheelSpin( w.wheel )
+                self:ManipulateBoneAngles( b.spin, spinAng, false )
+            end
 
-        for _, b in ipairs( self.rightWheelBones ) do
-            self:ManipulateBoneAngles( b, spinAng, false )
+            if b.steer then
+                steerAng[1] = -steering * w.angle
+                self:ManipulateBoneAngles( b.steer, steerAng, false )
+            end
         end
 
         -- roof machine gun: its body angle is relative to the hull, the bones to the turret
@@ -837,9 +894,14 @@ if SERVER then
 
     -- single-differential (clutch-brake) tanks pivot around the braked inner track instead of counter-rotating both
     ENT.WTSingleFlow = {"true" if options["singleFlow"] else "false"}
+    -- wheeled vehicles steer their axles like a car
+    ENT.CanTurnInPlace = {"false" if wheeled else "true"}
+    ENT.WTTracked = {"false" if wheeled else "true"}
 
     function ENT:WheelThink( dt, selfTbl )
         BaseClass.WheelThink( self, dt, selfTbl )
+
+        if not selfTbl.WTTracked then return end
 
         -- Glide gives every wheel a fixed share and drops the airborne ones' share; a track carries the
         -- sprocket's pull to whichever road wheels touch the ground, so they get their side's whole share
@@ -891,12 +953,8 @@ if SERVER then
         self:SetSideTractionMax( {12000 * massScale * perWheel:.0f} )
         self:SetSideTractionMin( {10000 * massScale * perWheel:.0f} )
 
-        -- tracks: scale Glide's per surface rolling resistance up (also for surfaces it has no entry for)
-        for id, r in pairs( self.surfaceResistance ) do
-            self.surfaceResistance[id] = r * {resistScale:.2f}
-        end
-
-        setmetatable( self.surfaceResistance, {{ __index = function() return {0.05 * resistScale:.3f} end }} )
+        self:SetMaxSteerAngle( {maxSteer:.1f} )
+{nl.join(rollingLines)}
 
         self:CreateSeat( {vec(seatPos)}, Angle( 0, 270, 0 ), Vector( 0, 150, 0 ), true )
 {nl.join(weaponLines)}
@@ -962,21 +1020,1081 @@ function ENT:ManipulateTurretBones( turretAng )
 end
 '''
 
-def writeAddon(addonDir:str, className:str, printName:str, modelPath:str, skeleton, blk:dict, tracks:dict = None, options:dict = None, gameRoot:str = None):
+# ---- aircraft (base_glide_plane / base_glide_heli) ----
+
+# animated (gear) and Lua driven (controls, wheels, rotors) nodes; the rest follows them
+AIRCRAFT_BONE_RE = re.compile(r"gear_\d*[lrc]\d*|wheel\d*_\d*[lrc]|aileron\d*_[lr]|elevator\d*|rudder\d*|prop01_\d+|nozzle\d+_\d+|jet_flame\d*")
+# jet nozzle petals and intake ramps (animtree ~nozzle_N: p_nozzle_N over the whole a2d timeline)
+AIRCRAFT_NOZZLE_RE = re.compile(r"nozzle\d+_\d+")
+# (thrust, p_nozzle) knots: p_nozzle 1 is the closed nozzle (MiG-29 exit r 0.29 m), 0 fully open (0.47 m); closed at idle, opening with thrust
+NOZZLE_MAP = ((0.0, 1.0), (1.0, 0.0))
+NOZZLE_SAMPLES = 5
+AIRCRAFT_GEAR_RE = re.compile(r"gear_\d*[lrc]\d*") # the animtree's p_gear_* nodes; the a2d runs retracted -> extended
+# meshes War Thunder only shows in some state: muzzle flashes, afterburner, chute, blurred and damaged props
+AIRCRAFT_HIDDEN_RE = re.compile(r"flare\d+|chute\d*|prop0[23]_\d+|.*_dmg")
+# the outer skin of the damage model, not the parts inside it or the moving gear
+AIRCRAFT_SKIN_RE = re.compile(r"(fuse|wing|tail|fin|elevator|aileron|flap|rudder|stab|keel|nose)\d*(_[lr])?\d*_dm")
+# Glide's GTA V jet (gtav_lazer) is tuned for a ~500 unit long airframe; turning torque must grow with inertia (~length^2)
+AIRCRAFT_REF_LENGTH = 500.0
+CONTROL_ANGLES = {"GetElevator": 20.0, "GetAileron": 20.0, "GetRudder": 25.0}
+SEQ_FPS = 30
+
+def isAircraft(blk:dict):
+	return "fm" in (blk or {})
+
+def isHelicopter(blk:dict):
+	return "helicopter" in (blk or {})
+
+def findAircraftBlk(assetPath:str, modelName:str):
+	"""gamedata/flightmodels/<model>.blk with its flight model as "fm" and weapon blks as "weaponBlk", or None"""
+	d = findGameRoot(assetPath)
+
+	if d is None:
+		return None
+
+	vfs = VROMFS(path.join(d, "aces.vromfs.bin"))
+	name = f"gamedata/flightmodels/{modelName.lower()}.blk"
+
+	if name not in vfs.files:
+		return None
+
+	blk = vfs.readBlk(name)
+
+	try:
+		blk["fm"] = vfs.readBlk(f"gamedata/flightmodels/{str(blk['fmFile']).lower()}")
+	except (KeyError, ValueError):
+		blk["fm"] = {}
+
+	for w in aircraftWeapons(blk):
+		try:
+			w["weaponBlk"] = vfs.readBlk(str(w.get("blk", "")).lower())
+		except Exception:
+			pass
+
+	return blk
+
+def findAircraftCollision(assetPath:str, modelName:str):
+	"""Aircraft keep their <model>_collision in a separate *aircraft_logic.grp under res/"""
+	from glob import glob
+	from parse.gameres import GameResourcePack
+
+	res = path.dirname(path.abspath(assetPath))
+
+	while path.basename(res).lower() != "res":
+		if path.dirname(res) == res:
+			return None
+
+		res = path.dirname(res)
+
+	for grp in glob(path.join(res, "*aircraft_logic.grp")) + glob(path.join(res, "*", "*aircraft_logic.grp")):
+		asset = next((a for a in GameResourcePack(grp).getPackedFiles() if a.name == f"{modelName}_collision"), None)
+
+		if asset is not None:
+			return asset
+
+	return None
+
+def builtinPreset(blk:dict):
+	"""The first preset of weapon slot 0 (the guns every loadout has)"""
+	slots = ((blk or {}).get("WeaponSlots") or {}).get("WeaponSlot") or []
+	slot = next((s for s in (slots if isinstance(slots, list) else [slots]) if s.get("index") == 0), {})
+	preset = slot.get("WeaponPreset") or {}
+
+	return (preset[0] if isinstance(preset, list) else preset) or {}
+
+def aircraftWeapons(blk:dict):
+	w = builtinPreset(blk).get("Weapon") or []
+
+	return [x for x in (w if isinstance(w, list) else [w]) if isinstance(x, dict) and not x.get("dummy")]
+
+def aircraftHiddenNodes(names:list[str], blk:dict):
+	"""Model nodes to drop: state-only meshes and the pylons/pods of loadouts other than the built-in guns"""
+	slots = (blk or {}).get("WeaponSlots") or {}
+	asList = lambda v: [v] if isinstance(v, str) else (v or [])
+	hidden = set(asList((slots.get("HideNodes") or {}).get("node"))) - set(asList((builtinPreset(blk).get("ShowNodes") or {}).get("node")))
+
+	return hidden | {n for n in names if AIRCRAFT_HIDDEN_RE.fullmatch(n)}
+
+def aircraftCollisionNodes(names:list[str]):
+	return {n for n in names if AIRCRAFT_SKIN_RE.fullmatch(n)} or set(names)
+
+def aircraftKeepBones(skeleton):
+	return {n.name for n in skeleton.getNodes() if AIRCRAFT_BONE_RE.fullmatch(n.name)}
+
+def _mat(tm):
+	import numpy as np
+
+	return np.array(tm, dtype = float)
+
+def _qvv(v):
+	"""4x4 from an a2d sample (quat xyzw, translation, scale)"""
+	import numpy as np
+
+	x, y, z, w = v[:4]
+	m = np.eye(4)
+	m[:3, :3] = np.array((
+		(1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)),
+		(2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)),
+		(2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)),
+	)) * v[7:10]
+	m[:3, 3] = v[4:7]
+
+	return m
+
+def poseWorld(skeleton, local:dict, only = None):
+	"""{node idx: Dagor world 4x4} with the a2d `local` transforms of nodes matching `only` (bind pose for the rest)"""
+	world = {}
+
+	for n in skeleton.getNodes(): # parents come first
+		L = _qvv(local[n.name]) if n.name in local and (only is None or only.fullmatch(n.name)) else _mat(n.tm)
+		world[n.idx] = world[n.parent.idx] @ L if n.parent is not None else L
+
+	return world
+
+def _euler(R):
+	"""SMD rotation (x, y, z radians, R = Rz Ry Rx)"""
+	from math import asin, atan2
+
+	return atan2(R[2][1], R[2][2]), asin(max(-1.0, min(1.0, -R[2][0]))), atan2(R[1][0], R[0][0])
+
+def poseSMD(skeleton, kept:list, world:dict):
+	"""One SMD skeleton frame of the rotation-free reduced skeleton (GeomNodeTree.getReducedSMD) posed by `world`"""
+	import numpy as np
+
+	M = np.diag((1.0, 1.0, -1.0)) # Dagor -> SMD mirror
+	bones = {}
+	lines = []
+
+	for i, n in enumerate(kept):
+		# the bone moves like its node: world delta from the bind pose, applied to the rotation-free rest
+		rest = np.eye(4)
+		rest[:3, 3] = _mat(n.wtm)[:3, 3]
+		bones[n.idx] = world[n.idx] @ np.linalg.inv(_mat(n.wtm)) @ rest
+		L = np.linalg.inv(bones[n.parent.idx]) @ bones[n.idx] if n.parent is not None else bones[n.idx]
+		R = M @ L[:3, :3] @ M
+		p = M @ L[:3, 3] * VERTEX_SCALE
+		lines.append(f"{i} {p[0]:.4f} {p[1]:.4f} {p[2]:.4f} " + " ".join(f"{a:.6f}" for a in _euler(R)))
+
+	return lines
+
+def nozzlePoses(skeleton, a2d):
+	"""{bone: [(SMD position offset, Source Angle (p, y, r)) per p_nozzle sample]} relative to the rest pose"""
+	from math import degrees
+
+	kept = skeleton.getReducedBones(aircraftKeepBones(skeleton))[0]
+	parse = lambda line: [float(v) for v in line.split()[1:]]
+	rest = [parse(l) for l in poseSMD(skeleton, kept, poseWorld(skeleton, {}))]
+	out = {}
+
+	for k in range(NOZZLE_SAMPLES):
+		lines = poseSMD(skeleton, kept, poseWorld(skeleton, a2d.sample(a2d.duration * k / (NOZZLE_SAMPLES - 1)), AIRCRAFT_NOZZLE_RE))
+
+		for n, line, r in zip(kept, lines, rest):
+			if AIRCRAFT_NOZZLE_RE.fullmatch(n.name):
+				v = parse(line)
+				# SMD R = Rz Ry Rx is Source's AngleMatrix(pitch = y, yaw = z, roll = x)
+				out.setdefault(n.name, []).append((tuple(a - b for a, b in zip(v[:3], r[:3])), (degrees(v[4]), degrees(v[5]), degrees(v[3]))))
+
+	return {k: v for k, v in out.items() if any(abs(x) > 0.01 for p, a in v for x in p + a)}
+
+def exhausts(skeleton):
+	"""[(Source centre, radius)] of the nozzles behind the middle of the airframe (nozzle3/4 on the MiG-29 are intakes)"""
+	groups = {}
+
+	for n in skeleton.getNodes():
+		if AIRCRAFT_NOZZLE_RE.fullmatch(n.name):
+			groups.setdefault(n.name.split("_")[0], []).append(gamePos(n))
+
+	out = []
+
+	for pts in groups.values():
+		c = tuple(sum(p[i] for p in pts) / len(pts) for i in range(3))
+
+		if c[0] < 0 and len(pts) > 4:
+			out.append((c, sum(((p[1] - c[1]) ** 2 + (p[2] - c[2]) ** 2) ** 0.5 for p in pts) / len(pts)))
+
+	return out
+
+def gearDuration(fm:dict, fallback:float = 3.333333):
+	"""Normalized actuator travel / rate; the A2D timeline only describes the poses."""
+	from math import isfinite
+	try:
+		speed = float(fm.get("GearActuatorSpeed", 0))
+	except (TypeError, ValueError):
+		return fallback
+	return 1 / speed if isfinite(speed) and 0.01 <= speed <= 100 else fallback
+
+
+def gearSequences(skeleton, keepBones:set[str], a2d, fm:dict = None):
+	"""Glide's LandingGearAnims sequences from the a2d gear nodes (start = retracted, end = extended)"""
+	kept = skeleton.getReducedBones(keepBones)[0]
+	nodes = skeleton.getReducedSMD(kept).split("skeleton")[0]
+	frames = max(round(gearDuration(fm or {}, a2d.duration) * SEQ_FPS), 1)
+	# shortcut: WT's relative aileron tracks are centred at 0.5; other controller families need their animtree mapping.
+	neutral = {n: v for n, v in a2d.sample(a2d.duration * 0.5).items() if re.fullmatch(r"aileron\d*_[lr]", n)}
+	def pose(t):
+		local = dict(neutral)
+		local.update({n: v for n, v in a2d.sample(t).items() if AIRCRAFT_GEAR_RE.fullmatch(n)})
+		return poseSMD(skeleton, kept, poseWorld(skeleton, local))
+	poses = [pose(a2d.duration * f / frames) for f in range(frames + 1)]
+	smd = lambda seq: nodes + "skeleton\n" + "\n".join(f"time {k}\n" + "\n".join(p) for k, p in enumerate(seq)) + "\nend\n"
+
+	return {
+		"idle": smd([poseSMD(skeleton, kept, poseWorld(skeleton, neutral))]),
+		"gear_down": smd([poses[-1]]),
+		"move_gear_up": smd(poses[::-1]),
+		"gear_up": smd([poses[0]]),
+		"move_gear_down": smd(poses),
+	}
+
+def smdAxis(node, axis = (0.0, 1.0, 0.0)):
+	"""A node-local Dagor axis in the reduced skeleton's bone space (model axes, SMD mirrored)"""
+	import numpy as np
+
+	a = _mat(node.wtm)[:3, :3] @ np.array(axis)
+	a = a / (np.linalg.norm(a) or 1)
+
+	return (float(a[0]), float(a[1]), float(-a[2]))
+
+def controlSurfaces(model):
+	"""[(bone, Glide input getter, SMD hinge axis, degrees at full input)]: War Thunder hinges them on their local Y
+	(animtree rotateNode dirAxis); the sign makes positive Glide input push the trailing edge the way it should."""
+	import numpy as np
+
+	skeleton = model.skeleton
+	out = []
+
+	for obj in model:
+		m = re.fullmatch(r"(aileron)\d*_([lr])|(elevator)\d*|(rudder)\d*", obj.name)
+		node = skeleton.getNodeByName(obj.name) if m and skeleton is not None and not obj.skinned else None
+		idx = {i for f in obj.faces for i in f}
+
+		if node is None or not idx:
+			continue
+
+		M = np.array((1.0, 1.0, -1.0))
+		centre = np.mean([model.getVertex(i, True, node) for i in idx], axis = 0) - _mat(node.wtm)[:3, 3] * VERTEX_SCALE
+		move = np.cross(smdAxis(node), centre * M) # trailing edge motion for a small positive turn (SMD: y up, z right)
+
+		if m[1]: # roll right: left aileron down, right aileron up
+			getter, sign = "GetAileron", -np.sign(move[1]) * (1 if m[2] == "l" else -1)
+		elif m[3]: # pitch down: trailing edge down
+			getter, sign = "GetElevator", -np.sign(move[1])
+		else: # yaw right: trailing edge right
+			getter, sign = "GetRudder", np.sign(move[2])
+
+		out.append((obj.name, getter, smdAxis(node), float(sign or 1) * CONTROL_ANGLES[getter]))
+
+	return out
+
+def aircraftWheels(skeleton, a2d, fm:dict):
+	"""[(wheel node, Source pos with the gear down, radius, steers)] from the wheel_[lrc] nodes and the FM struts"""
+	world = poseWorld(skeleton, a2d.sample(a2d.duration), AIRCRAFT_GEAR_RE) if a2d else None
+	gear = (fm or {}).get("Gear") or {}
+	wheels = []
+
+	for n in skeleton.getNodes():
+		m = re.fullmatch(r"wheel_(\d*)([lrc])", n.name)
+
+		if not m:
+			continue
+
+		w = world[n.idx] if world else _mat(n.wtm)
+		strut = gear.get(f"Strut{m[2].upper()}{m[1]}") or gear.get(f"Strut{m[2].upper()}") or {}
+		radius = float(strut.get("WheelRadus", 0.35)) * VERTEX_SCALE
+		wheels.append((n.name, (w[0][3] * VERTEX_SCALE, w[2][3] * VERTEX_SCALE, w[1][3] * VERTEX_SCALE), radius, m[2] == "c"))
+
+	return wheels
+
+def aircraftMass(fm:dict):
+	mass = (fm or {}).get("Mass") or {}
+
+	return min(float(mass.get("EmptyMass", 5000)) + float(mass.get("MaxFuelMass0", 0)), 50000)
+
+def aircraftGuns(skeleton, blk:dict):
+	"""[(class, [Source muzzle positions], fire delay, damage, weapon)] grouped by trigger and weapon."""
+	guns = {}
+
+	for w in aircraftWeapons(blk):
+		node = skeleton.getNodeByName(str(w.get("emitter", ""))) or skeleton.getNodeByName(str(w.get("flash", "")))
+
+		if w.get("trigger") in ("cannon", "machinegun", "guns") and node is not None:
+			guns.setdefault((w["trigger"], w.get("blk", "")), (w, []))[1].append(gamePos(node))
+
+	out = []
+
+	for trigger, (w, muzzles) in guns.items():
+		wb = w.get("weaponBlk", {})
+		bullet = wb.get("bullet") or {}
+		cal = float((bullet[0] if isinstance(bullet, list) else bullet).get("caliber", 0.0127)) * 1000 # m
+		out.append(("explosive_cannon" if cal >= 20 else "base", muzzles, 1 / max(float(wb.get("shotFreq", 10)), 0.1), round(max(cal, 5) * 2.5), w))
+
+	return out
+
+def exportAircraftSounds(gameRoot:str, blk:dict, outDir:str):
+	"""Resolve exact unit/weapon event references; missing events keep Glide's defaults."""
+	from util.wtsound import SoundBank, Renderer, readStrings, writeWav, finish, SOURCE_RATE
+	import numpy as np
+
+	soundDir = path.join(gameRoot, "sound")
+	if not path.isfile(path.join(soundDir, "masterbank.strings.bank")):
+		return {}
+	strings = readStrings(path.join(soundDir, "masterbank.strings.bank"))
+	makedirs(outDir, exist_ok = True)
+	out, banks, sources = {"guns": {}}, {}, {}
+
+	def resolve(bankName, event):
+		guid = strings.get(event)
+		if not guid:
+			raise ValueError(f"Missing FMOD event {event}")
+		if bankName not in banks:
+			banks[bankName] = SoundBank(soundDir, bankName)
+		bank = banks[bankName]
+		bank.decode(bank.walk(guid))
+		return bank, guid
+
+	def save(stem, pcm, loop = False):
+		if not len(pcm) or np.max(np.abs(pcm)) < 1e-6:
+			raise ValueError(f"Silent FMOD render: {stem}")
+		writeWav(path.join(outDir, stem + ".wav"), finish(pcm), SOURCE_RATE, loop)
+		return stem
+
+	for w in aircraftWeapons(blk):
+		ref = w.get("blk", "")
+		if ref in out["guns"] or w.get("trigger") not in ("cannon", "machinegun", "guns"):
+			continue
+		cfg = w.get("weaponBlk", {}).get("gunSound", {})
+		event = f'event:/{cfg.get("pathStudio", "")}/{cfg.get("outside", "")}'
+		try:
+			bank, guid = resolve("aircraft_guns", event)
+			# shortcut: per-shot close samples, not FMOD's distance/cone/first-last-shot mixer.
+			shotName = cfg["outside"].removesuffix("_outside").removeprefix("cannon_")
+			shots = sorted((bank.sample(bank.waves[i.wave])[0], g) for g in bank.walk(guid)
+				if (i := bank.instruments.get(g)) and i.wave in bank.waves
+				and bank.sample(bank.waves[i.wave])[0].startswith(shotName + "_close-"))
+			if not shots:
+				raise ValueError(f"No single-shot close samples in {event}")
+			renderer = Renderer(bank, {"on_shot": 1})
+			prefix = f"gun{len(out['guns'])}"
+			out["guns"][ref] = [save(f"{prefix}_{n}", renderer.instrument(g)) for n, (_, g) in enumerate(shots[:4])]
+			sources[ref] = {"event": event, "samples": [name for name, _ in shots[:4]], "cockpitEvent": cfg.get("cockpit")}
+		except Exception as e:
+			log.log(f"Aircraft gun sound unavailable ({ref}): {e}", 2)
+
+	engine = (blk.get("Sound") or {}).get("Engine")
+	if engine and isHelicopter(blk):
+		try:
+			cfg = VROMFS(path.join(gameRoot, "aces.vromfs.bin")).readBlk("config/sound_studio.blk")[engine]
+			loops, provenance = [], []
+			for group in ("engines", "propellers"):
+				outside = cfg[group]["outside"]
+				events = [(key, value) for key, value in outside.items() if key.startswith("event") and isinstance(value, str) and value]
+				if not events:
+					raise ValueError(f"Missing {group} events for {engine}")
+				for key, name in events:
+					event = f'event:/{outside["path"]}/{name}'
+					bank, guid = resolve("aircraft_engines", event)
+					# shortcut: healthy nominal-RPM exterior mix; add live FMOD controllers for cockpit/load/distance fidelity.
+					params = {"load": 0.5, "broken": 0, "rotor_broken": 0, "depth": -1000, "Distance": 0}
+					for layout in bank.events[guid].layouts:
+						param = bank.layouts[layout][0]
+						pname, lo, hi, default = bank.params.get(param, ("", 0, 0, 0))
+						if pname in ("rpm", "rpm2", "rpm_result"):
+							params[pname] = hi
+					stem = save(f"heli_{len(loops)}", Renderer(bank, params).event(guid, 8), True)
+					loops.append(stem)
+					provenance.append({"config": f"{engine}/{group}/outside/{key}", "event": event, "params": params})
+			# Replace defaults only after both engine and rotor groups have been rendered successfully.
+			out["helicopter"] = loops
+			sources["helicopter"] = provenance
+		except Exception as e:
+			log.log(f"Helicopter sound unavailable ({engine}): {e}", 2)
+	if engine and not isHelicopter(blk):
+		event = f"event:/aircraft/engines/{engine}"
+		try:
+			bank, guid = resolve("aircraft_engines", event)
+			# shortcut: three native FMOD operating points crossfaded by power; not the complete RPM/distance simulation.
+			loops = {}
+			for key, rpm, wep in (("idle", 1000, 0), ("full", 2500, 0), ("wep", 2500, 1)):
+				loops[key] = save(f"engine_{key}", Renderer(bank, {"rpm": rpm, "wep": wep, "distance": 0, "depth": -1000}).event(guid, 8), True)
+			out["engine"] = loops
+			sources["engine"] = {"event": event, "operatingPoints": [[1000, 0], [2500, 0], [2500, 1]]}
+		except Exception as e:
+			log.log(f"Aircraft engine sound unavailable ({engine}): {e}", 2)
+
+	try:
+		cfg = VROMFS(path.join(gameRoot, "aces.vromfs.bin")).readBlk("config/sound_studio.blk")
+		# WT calls the common aircraft landing-gear event 'chasis' (one s).
+		event = "event:/" + cfg["misc_effects"]["path"] + "/" + cfg["misc_effects"]["eventChasis"]
+		bank, guid = resolve("aircraft_effects", event)
+		renderer = Renderer(bank)
+		parts = {}
+		for g in bank.walk(guid):
+			i = bank.instruments.get(g)
+			if i and i.wave in bank.waves:
+				name = bank.sample(bank.waves[i.wave])[0]
+				if name in ("chasis_start", "chasis_loop", "chasis_end"):
+					parts[name.removeprefix("chasis_")] = renderer.instrument(g)
+		if len(parts) != 3:
+			raise ValueError("Incomplete landing gear event")
+		# Keep the motor at its native pitch; stop it at the compiled sequence's endpoint.
+		out["gear"] = {k: save("gear_" + k, pcm, k == "loop") for k, pcm in parts.items()}
+		sources["gear"] = {"event": event, "samples": ["chasis_" + k for k in parts],
+			"actuatorSeconds": gearDuration(blk.get("fm") or {})}
+	except Exception as e:
+		log.log(f"Aircraft landing gear sound unavailable: {e}", 2)
+
+	with open(path.join(outDir, "sources.json"), "w", encoding = "utf-8") as f:
+		json.dump(sources, f, indent = 2)
+	return out
+
+
+def jetVolumeRamps(gameRoot:str, volume:dict):
+	"""after_burner PS selects four atlas rows per rampTextureOffset (depth/height/radius/rings)."""
+	from io import BytesIO
+	from PIL import Image
+	from parse.material import DDSxTexturePack2
+
+	pack = DDSxTexturePack2(path.join(gameRoot, "content/base/res/fx.dxp.bin"))
+	tex = next(t for t in pack.getPackedFiles() if t.name == "afterburneratlastex")
+	img = Image.open(BytesIO(tex.getDDS())).convert("RGB")
+	row = int(volume["rampTextureOffset"]) * 4
+	if row < 0 or row + 4 > img.height:
+		raise ValueError("Afterburner ramp outside atlas")
+	return [[list(img.getpixel((round(x * (img.width - 1) / 31), y))) for x in range(32)] for y in range(row, row + 4)]
+
+
+def jetHeatNormal(img):
+	"""Convert Dagor RG displacement (neutral 127) to Source normal-map XY; B/A aren't normal/opacity."""
+	import numpy as np
+	from PIL import Image
+
+	x = np.asarray(img.convert("RGBA"), dtype = np.float32)
+	xy = (x[..., :2] - 127) / 255
+	z = np.sqrt(np.maximum(0, 1 - (xy * xy).sum(axis = 2)))
+	out = np.empty_like(x)
+	out[..., :2] = (xy + 1) * 127.5
+	out[..., 2] = (z + 1) * 127.5
+	out[..., 3] = 255
+
+	return Image.fromarray(np.rint(out).clip(0, 255).astype(np.uint8))
+
+def exportJetHeat(gameRoot:str, addonDir:str, vtfCmd:str):
+	"""fx.grp's haze_jet_fx and haze_jet_smooth_fx both reference this distortion texture."""
+	from io import BytesIO
+	from tempfile import TemporaryDirectory
+	from subprocess import run
+	from PIL import Image
+	from parse.material import DDSxTexturePack2
+
+	pack = DDSxTexturePack2(path.join(gameRoot, "content/base/res/fx.dxp.bin"))
+	tex = next(t for t in pack.getPackedFiles() if t.name == "distortion_hot_air_a_tex")
+	outDir = path.join(addonDir, "materials/models/wt_glide/fx")
+	makedirs(outDir, exist_ok = True)
+
+	with TemporaryDirectory() as temp:
+		imgPath = path.join(temp, "distortion_hot_air_a_normal.tga")
+		jetHeatNormal(Image.open(BytesIO(tex.getDDS()))).save(imgPath)
+		run([vtfCmd, "-file", imgPath, "-output", temp, "-version", "7.2", "-format", "RGBA8888", "-alphaformat", "RGBA8888", "-flag", "NORMAL"], check = True)
+		# VTFCmd can report success without writing an image; never emit a dangling material reference.
+		from shutil import copyfile
+		copyfile(path.join(temp, "distortion_hot_air_a_normal.vtf"), path.join(outDir, "distortion_hot_air_a_normal.vtf"))
+
+	return "models/wt_glide/fx/distortion_hot_air_a_normal"
+
+def generateAircraftLua(className:str, printName:str, modelPath:str, skeleton, blk:dict, a2d = None, surfaces:list = None, heatTexture:str = "", sounds:dict = None):
+	fm = blk.get("fm") or {}
+	sounds = sounds or {}
+	soundDir = f"wt/{className}"
+	heli = isHelicopter(blk)
+	base = "base_glide_heli" if heli else "base_glide_plane"
+	node = skeleton.getNodeByName
+	mass = aircraftMass(fm)
+	positions = [gamePos(n) for n in skeleton.getNodes()]
+	length = max(float(fm.get("Length", 0)) * VERTEX_SCALE, max(p[0] for p in positions) - min(p[0] for p in positions), 100.0)
+	rot = (length / AIRCRAFT_REF_LENGTH) ** 2
+	pilot = node("pilot1") or node("pilot")
+	seats = [gamePos(pilot) if pilot else (length * 0.25, 0, 40)] + [gamePos(n) for n in (node("gunner1"),) if n]
+	wheels = aircraftWheels(skeleton, a2d, fm)
+	suspension = REST_COMPRESSION + BUMP_TRAVEL
+	spring = mass * GLIDE_WEIGHT / (max(len(wheels), 1) * REST_COMPRESSION)
+	# gtav_lazer's damping ratio (10000 for 1500 spring on a 1500 kg, 3 wheel jet)
+	damper = 10000 / sqrt(1500 * 500) * sqrt(spring * mass / max(len(wheels), 1))
+	massScale = mass / 1500 # gtav_lazer's mass
+	props = [n for n in skeleton.getNodes() if re.fullmatch(r"prop01_\d+", n.name)]
+	nl = "\n"
+
+	wheelLines = [
+		f"        self:CreateWheel( {vec((p[0], p[1], p[2] + BUMP_TRAVEL))}, {{ radius = {r:.1f}, steerMultiplier = {1 if steer else 0}, suspensionLength = {suspension:.1f}, "
+		f"springStrength = {spring:.0f}, springDamper = {damper:.0f}, brakePower = {2000 * massScale:.0f}, forwardTractionMax = {2600 * massScale:.0f}, sideTractionMultiplier = {250 * massScale:.0f}, "
+		f"sideTractionMax = {2400 * massScale:.0f}, sideTractionMin = {800 * massScale:.0f} }} )"
+		for _, p, r, steer in wheels
+	]
+	seatLines = [f"        self:CreateSeat( {vec(p)}, Angle( 0, 270, 10 ), Vector( 0, {length * 0.4:.0f}, 0 ), true )" for p in seats]
+	weaponLines, soundLines = [], []
+	for index, (cls, muzzles, delay, damage, weapon) in enumerate(aircraftGuns(skeleton, blk)):
+		files = sounds.get("guns", {}).get(weapon.get("blk"), [])
+		soundName = f"{className}.Gun{index}"
+		if files:
+			soundLines.append(f'sound.Add( {{ name = "{soundName}", channel = CHAN_WEAPON, volume = 1, level = 95, pitch = 100, sound = {{ ' + ", ".join(json.dumps(f"{soundDir}/{stem}.wav") for stem in files) + ' } } )')
+		soundOption = f'SingleShotSound = {json.dumps(soundName)}, ' if files else ""
+		weaponLines.append(f'        self:CreateWeapon( "{cls}", {{ FireDelay = {delay:.5f}, Damage = {damage}, {soundOption}ProjectileOffsets = {{ {", ".join(vec(p) for p in muzzles)} }} }} )')
+	surfaceLines = [f'        {{ bone = "{b}", input = "{g}", axis = Vector( {a[0]:.4f}, {a[1]:.4f}, {a[2]:.4f} ), angle = {ang:.1f} }},' for b, g, a, ang in surfaces or []]
+	# Glide's wheels index in creation order
+	spinLines = [f'        {{ bone = "{name}", wheel = {k + 1}, axis = Vector( {a[0]:.4f}, {a[1]:.4f}, {a[2]:.4f} ) }},' for k, (name, *_) in enumerate(wheels) for a in [smdAxis(node(name))]]
+	# main rotor / propellers spin with power (visual only: Glide's own rotor entities are hidden)
+	nozzleLines = [
+		f'        {{ bone = "{b}", frames = {{ ' + ", ".join(f"{{ Vector( {p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f} ), Angle( {a[0]:.2f}, {a[1]:.2f}, {a[2]:.2f} ) }}" for p, a in frames) + " } },"
+		for b, frames in (nozzlePoses(skeleton, a2d) if a2d else {}).items()
+	]
+	ex = exhausts(skeleton)
+	flameLines = []
+
+	for n in skeleton.getNodes():
+		if re.fullmatch(r"jet_flame\d*", n.name):
+			c = gamePos(n) # the node sits at the nozzle exit; plume width follows the nearest nozzle
+			r = min(ex, key = lambda e: sum((a - b) ** 2 for a, b in zip(e[0], c)))[1] if ex else 20.0
+			flameLines.append(f'        {{ bone = "{n.name}", pos = {vec(c)}, radius = {r:.1f} }},')
+	exhaustLines = [f"        {{ pos = {vec((c[0] - 10, c[1], c[2]))}, scale = {r / 12:.2f} }}," for c, r in ex]
+	propLines = [f'        {{ bone = "{n.name}", speed = {1500 if n.name == "prop01_1" else 3000}, axis = Vector( {a[0]:.4f}, {a[1]:.4f}, {a[2]:.4f} ) }},' for n in props for a in [smdAxis(n)]]
+
+	if heli:
+		props_ = {p.name: p for p in props}
+		main, tail = props_.get("prop01_1"), props_.get("prop01_2")
+		radius = lambda k, d: float(((fm.get(f"Propeller{k}") or {}).get("Geometry") or {}).get("Radius", d)) * VERTEX_SCALE
+		typeLines = [
+			f"ENT.MainRotorOffset = {vec(gamePos(main) if main else (0, 0, 120))}",
+			f"ENT.TailRotorOffset = {vec(gamePos(tail) if tail else (-length * 0.6, 0, 60))}",
+		]
+		serverLines = [
+			f"    ENT.MainRotorRadius = {radius(0, 6):.0f}",
+			f"    ENT.TailRotorRadius = {radius(1, 1):.0f}",
+			"    -- the rotor blades are in the chassis model; Glide's rotor entities only do the collisions",
+			'    ENT.MainRotorModel = "models/hunter/plates/plate.mdl"',
+			'    ENT.MainRotorFastModel = ""',
+			'    ENT.TailRotorModel = "models/hunter/plates/plate.mdl"',
+			'    ENT.TailRotorFastModel = ""',
+			"    ENT.HelicopterParams = {",
+			f"        pitchForce = {700 * rot:.0f},",
+			f"        yawForce = {700 * rot:.0f},",
+			f"        rollForce = {700 * rot:.0f},",
+			f"        uprightForce = {1000 * rot:.0f},",
+			"    }",
+			"",
+			"    function ENT:CreateRotors()",
+			"        BaseClass.CreateRotors( self )",
+			"",
+			"        for _, r in ipairs( self.rotors ) do",
+			"            if IsValid( r ) then r:SetNoDraw( true ) end",
+			"        end",
+			"    end",
+		]
+		clientLines = []
+	else:
+		typeLines = []
+		serverLines = [
+			f"    ENT.ReverseTorque = {2000 * massScale:.0f}",
+			"    ENT.SteerConeMaxSpeed = 900",
+			"    ENT.PlaneParams = {",
+			f"        liftAngularDrag = Vector( {-20 * rot:.0f}, {-70 * rot:.0f}, {-100 * rot:.0f} ), -- (Roll, pitch, yaw)",
+			"        maxSpeed = 2400,",
+			"        liftSpeed = 1800,",
+			"        engineForce = 350,",
+			f"        pitchForce = {5500 * rot:.0f},",
+			f"        yawForce = {3500 * rot:.0f},",
+			f"        rollForce = {3500 * rot:.0f}",
+			"    }",
+		]
+		# jets sound like gtav_lazer, propeller planes keep base_glide_plane's
+		clientLines = [] if props else [
+			'    ENT.StartSound = "glide/aircraft/start_4.wav"',
+			'    ENT.DistantSoundPath = "glide/aircraft/jet_stream.wav"',
+			'    ENT.PropSoundPath = "glide/aircraft/thrust_b11.wav"',
+			"    ENT.PropSoundVolume = 0.5",
+			"    ENT.PropSoundLevel = 90",
+			"    ENT.PropSoundMinPitch = 80",
+			"    ENT.PropSoundMaxPitch = 120",
+			'    ENT.EngineSoundPath = "glide/aircraft/engine_luxor.wav"',
+			"    ENT.EngineSoundLevel = 90",
+			"    ENT.EngineSoundVolume = 0.4",
+			"    ENT.EngineSoundMinPitch = 103",
+			"    ENT.EngineSoundMaxPitch = 132",
+			'    ENT.ExhaustSoundPath = "glide/aircraft/distant_laser.wav"',
+			"    ENT.ExhaustSoundLevel = 90",
+			"    ENT.ExhaustSoundVolume = 0.5",
+			"    ENT.ExhaustSoundMinPitch = 55",
+			"    ENT.ExhaustSoundMaxPitch = 60",
+			'    ENT.ThrustSound = "glide/aircraft/thrust.wav"',
+			"    ENT.ThrustSoundMinPitch = 90",
+			"    ENT.ThrustSoundMaxPitch = 100",
+			"    ENT.ThrustSoundLowVolume = 0.1",
+			"    ENT.ThrustSoundHighVolume = 0.4",
+		]
+
+	if sounds.get("gear"):
+		gear = {k: json.dumps(f"{soundDir}/{v}.wav") for k, v in sounds["gear"].items()}
+		serverLines += [
+			'    ENT.LandingGearSounds = { [0] = { "" }, [1] = { "" }, [2] = { "" }, [3] = { "" } }',
+			"    function ENT:OnLandingGearStateChange( state )",
+			"        local moving = state == 1 or state == 3",
+			"        if moving then",
+			f'            self:EmitSound( {gear["start"]}, 80, 100, 0.7 )',
+			f'            self.wtGearMotor = self.wtGearMotor or CreateSound( self, {gear["loop"]} )',
+			"            self.wtGearMotor:PlayEx( 0.7, 100 )",
+			"            self:CallOnRemove( \"WTGearMotor\", function( ent )",
+			"                if ent.wtGearMotor then ent.wtGearMotor:Stop() end",
+			"            end )",
+			"        elseif self.wtGearMoving then",
+			"            if self.wtGearMotor then self.wtGearMotor:Stop() end",
+			f'            self:EmitSound( {gear["end"]}, 80, 100, 0.7 )',
+			"        end",
+			"        self.wtGearMoving = moving",
+			"    end",
+		]
+
+	volume = ((blk.get("AfterBurner0") or {}).get("volumetricAfterBurner") or {})
+	# shortcut: nested emissive meshes approximate WT's absorbing volume; replace with a custom shader for true ray integration.
+	volumeLua = json.dumps(volume, separators = (",", ":"))
+	if heli and sounds.get("helicopter"):
+		clientLines += [
+			'    ENT.StartSound = ""', '    ENT.RotorBeatInterval = 0',
+			'    function ENT:OnActivateSounds()',
+			* [f'        self:CreateLoopingSound( "wt_heli_{n}", "{soundDir}/{stem}.wav", 85 ):PlayEx( 0, 100 )' for n, stem in enumerate(sounds["helicopter"])],
+			'    end',
+			'    function ENT:OnUpdateSounds()',
+			'        local power = math.Clamp( self:GetPower(), 0, 1.2 )',
+			'        local vol = Glide.Config.GetVolume( "aircraftVolume" ) * math.Clamp( power, 0, 1 )',
+			'        for id, snd in pairs( self.sounds ) do',
+			'            if string.StartWith( id, "wt_heli_" ) then',
+			'                snd:ChangePitch( math.Clamp( power * 100, 1, 120 ) )',
+			'                snd:ChangeVolume( vol )',
+			'            end', '        end',
+			'        local dying = self:GetIsEngineDying() and LocalPlayer():GlideGetVehicle() == self',
+			'        if dying and not self.sounds.engineWarning and self.EngineFailSound ~= "" then',
+			'            self:CreateLoopingSound( "engineWarning", self.EngineFailSound, 130 ):PlayEx( self.EngineFailVolume, 130 )',
+			'        elseif not dying and self.sounds.engineWarning then',
+			'            self.sounds.engineWarning:Stop()', '            self.sounds.engineWarning = nil',
+			'        end', '    end', '']
+	if sounds.get("engine") and not heli:
+		clientLines += [f'    ENT.{key} = ""' for key in ("StartSound", "DistantSoundPath", "PropSoundPath", "EngineSoundPath", "ExhaustSoundPath", "ThrustSound")]
+		clientLines += [
+			"    function ENT:OnActivateSounds()",
+			* [f'        self:CreateLoopingSound( "wt_{k}", "{soundDir}/{v}.wav", 90 )' for k, v in sounds["engine"].items()],
+			"    end",
+			"    function ENT:OnUpdateSounds()",
+			"        BaseClass.OnUpdateSounds( self )",
+			"        local p = self:GetPower()",
+			"        local thrust = math.Clamp( p - 1, 0, 1 )",
+			"        local wep = math.Clamp( ( thrust - 0.8 ) / 0.2, 0, 1 )",
+			'        local volume = math.Clamp( p, 0, 1 ) * Glide.Config.GetVolume( "aircraftVolume" )',
+			"        local weights = { idle = 1 - thrust, full = thrust * ( 1 - wep ), wep = wep }",
+			"        for key, weight in pairs( weights ) do",
+			'            local snd = self.sounds["wt_" .. key]',
+			"            if snd then",
+			"                snd:ChangePitch( 100 )",
+			"                snd:ChangeVolume( volume * weight )",
+			"            end",
+			"        end",
+			"    end",
+		]
+
+	return f'''AddCSLuaFile()
+
+-- Generated by Dagor Asset Explorer
+ENT.Type = "anim"
+ENT.Base = "{base}"
+ENT.PrintName = "{printName}"
+
+ENT.GlideCategory = "War Thunder"
+ENT.ChassisModel = "{modelPath}"
+{nl.join(typeLines)}
+{nl.join(soundLines)}
+
+DEFINE_BASECLASS( "{base}" )
+
+-- Glide's spawn menu only lists categories registered here
+list.Set( "GlideCategories", "War Thunder", {{ name = "War Thunder", icon = "glide/icons/tank.png" }} )
+
+if CLIENT then
+    ENT.CameraOffset = Vector( {-length * 1.2:.0f}, 0, {length * 0.2:.0f} )
+    ENT.WTHideCrew = true
+{nl.join(clientLines)}
+
+    -- the crew sits inside the cockpit
+    hook.Add( "PrePlayerDraw", "WTGlide.HideCrew", function( ply )
+        local vehicle = ply:GlideGetVehicle()
+
+        if IsValid( vehicle ) and vehicle.WTHideCrew then return true end
+    end )
+
+    -- bone = turns by `angle` degrees around `axis` at full input (bones are the model's axes, Y up)
+    local SURFACES = {{
+{nl.join(surfaceLines)}
+    }}
+
+    local WHEELS = {{
+{nl.join(spinLines)}
+    }}
+
+    local PROPS = {{
+{nl.join(propLines)}
+    }}
+
+    -- bone pose (offset, angles) at evenly spaced War Thunder p_nozzle values 0..1
+    local NOZZLES = {{
+{nl.join(nozzleLines)}
+    }}
+
+    -- Native nozzle positions; the original cards are hidden and the plume is a three-dimensional mesh.
+    local FLAMES = {{
+{nl.join(flameLines)}
+    }}
+
+    -- Glide afterburner effects at the jet nozzles, for jets without flame meshes
+    local EXHAUSTS = {{
+{nl.join(exhaustLines)}
+    }}
+
+    ENT.ExhaustPositions = {{}}
+    ENT.EngineFireOffsets = {{}}
+
+    for _, e in ipairs( EXHAUSTS ) do
+        ENT.ExhaustPositions[#ENT.ExhaustPositions + 1] = e.pos
+        ENT.EngineFireOffsets[#ENT.EngineFireOffsets + 1] = {{ offset = e.pos, angle = Angle( 270, 0, 0 ), scale = e.scale * 0.5 }}
+    end
+
+    local Effect = util.Effect
+
+    function ENT:OnUpdateParticles()
+        BaseClass.OnUpdateParticles( self )
+
+        local power = self:GetPower()
+        if power < 0.5 or #FLAMES > 0 then return end
+
+        local throttle = self:GetThrottle()
+        local eff = EffectData()
+
+        for _, e in ipairs( EXHAUSTS ) do
+            eff:SetEntity( self )
+            eff:SetOrigin( self:LocalToWorld( e.pos ) )
+            eff:SetAngles( self:GetAngles() )
+            eff:SetScale( e.scale )
+            eff:SetMagnitude( power )
+            Effect( "glide_afterburner", eff, true )
+
+            if throttle > 0.1 then
+                eff:SetMagnitude( throttle * power )
+                eff:SetRadius( 15 * e.scale )
+                Effect( "glide_afterburner_flame", eff, true )
+            end
+        end
+    end
+
+    local plumeMat
+    local VOLUME = util.JSONToTable( [=[{volumeLua}]=] )
+    local volumeMat = CreateMaterial( "{className}_jet_volume", "UnlitGeneric", {{
+        ["$basetexture"] = "models/debug/debugwhite", ["$additive"] = 1,
+        ["$vertexcolor"] = 1, ["$vertexalpha"] = 1, ["$nocull"] = 1
+    }} )
+    local volumeMesh
+    local RAMPS = util.JSONToTable( [=[{json.dumps(blk.get('afterburnerRamps', []))}]=] )
+
+    local function Ramp( row, x )
+        local colors = RAMPS[row]
+        if not colors then return Vector( 1, 0.34, 0.23 ) end
+        local f = math.Clamp( x, 0, 1 ) * ( #colors - 1 )
+        local i = math.min( math.floor( f ) + 1, #colors - 1 )
+        local a, b = colors[i], colors[i + 1]
+        return Vector( Lerp( f - i + 1, a[1], b[1] ), Lerp( f - i + 1, a[2], b[2] ), Lerp( f - i + 1, a[3], b[3] ) ) / 255
+    end
+
+    local function BuildVolume()
+        local rings, sides, layers = 32, 24, 12 -- 55296 static vertices, below Source's 65535 limit
+        local body = VOLUME.relativeCylinderHeightMax or 0.36
+        local radius = VOLUME.maxRadius or 0.3
+        local baseRadius = VOLUME.maxBaseRadius or 0.4
+        local outerRadius = VOLUME.maxOuterCylinderRadius or 0.42
+        local result = Mesh( volumeMat )
+        mesh.Begin( result, MATERIAL_TRIANGLES, rings * sides * layers * 2 )
+        local function Vertex( t, theta, layer )
+            local tail = math.Clamp( ( t - body ) / ( 1 - body ), 0, 1 )
+            local r = Lerp( math.min( t / body, 1 ), baseRadius, radius )
+            r = ( r + ( outerRadius - radius ) * layer ) * ( 1 - tail * tail ) * ( 0.28 + 0.72 * layer )
+            local fade = ( 1 - tail ) ^ ( VOLUME.tailHeightFadeMax or 2 )
+            -- Approximate optical depth per radial shell, not WT's per-pixel ray/volume intersection.
+            local depth = 1 - math.exp( -( VOLUME.absorption or 1 ) * 2 * r * ( 1 - layer ) )
+            local opacity = 1 - math.exp( -( VOLUME.outerCylinderAbsorptionMax or 0.4 ) / layers )
+            local alpha = 255 * opacity * ( 1 - layer * layer ) * fade * math.min( t * 40, 1 )
+            local color = Ramp( 1, depth ) + Ramp( 2, 1 - t ) * ( VOLUME.colorOverHeightMult or 0.4 )
+            color = color + Ramp( 3, 1 - layer ) * ( 1 - t ) ^ ( VOLUME.colorOverRadiusFadeOverHeight or 3 )
+            color = color * ( VOLUME.colorIntensityMax or 7 ) * 0.25
+            local red, green, blue = math.min( color.x, 1 ), math.min( color.y, 1 ), math.min( color.z, 1 )
+            mesh.Position( Vector( -t, math.cos( theta ) * r, math.sin( theta ) * r ) )
+            mesh.Color( red * 255, green * 255, blue * 255, alpha )
+            mesh.TexCoord( 0, 0.5, 0.5 )
+            mesh.AdvanceVertex()
+        end
+        for layer = 1, layers do
+            for ring = 0, rings - 1 do
+                local a, b = ring / rings, ( ring + 1 ) / rings
+                for side = 0, sides - 1 do
+                    local c, d = side * math.pi * 2 / sides, ( side + 1 ) * math.pi * 2 / sides
+                    Vertex( a, c, layer / layers ) Vertex( b, c, layer / layers ) Vertex( b, d, layer / layers )
+                    Vertex( a, c, layer / layers ) Vertex( b, d, layer / layers ) Vertex( a, d, layer / layers )
+                end
+            end
+        end
+        mesh.End()
+        return result
+    end
+    hook.Add( "OnReloaded", "{className}.VolumeCleanup", function()
+        if volumeMesh then volumeMesh:Destroy() volumeMesh = nil end
+    end )
+
+    -- shortcut: WT's jet distortion texture via Source Refract, not Dagor's particle/depth/noise passes
+    local HEAT = {str(bool(heatTexture)).lower()} and CreateMaterial( "{className}_jet_heat_puffs", "Refract", {{
+        ["$normalmap"] = "{heatTexture}",
+        ["$refractamount"] = 0.008,
+        ["$bluramount"] = 0,
+        ["$vertexalpha"] = 1,
+        ["$vertexcolor"] = 1,
+        ["$translucent"] = 1,
+        ["$forcerefract"] = 1,
+        ["$nofog"] = 1,
+        ["$model"] = 1,
+        ["$nocull"] = 1
+    }} )
+
+    local function Quad( a, b, c, d, u0, v0, u1, v1, alpha )
+        local tangent = ( b - a ):GetNormalized()
+        local normal = tangent:Cross( d - a ):GetNormalized()
+        mesh.Begin( MATERIAL_QUADS, 1 )
+        mesh.Position( a ) mesh.Normal( normal ) mesh.UserData( tangent.x, tangent.y, tangent.z, 1 ) mesh.TexCoord( 0, u0, v0 ) mesh.Color( 255, 255, 255, alpha ) mesh.AdvanceVertex()
+        mesh.Position( b ) mesh.Normal( normal ) mesh.UserData( tangent.x, tangent.y, tangent.z, 1 ) mesh.TexCoord( 0, u1, v0 ) mesh.Color( 255, 255, 255, alpha ) mesh.AdvanceVertex()
+        mesh.Position( c ) mesh.Normal( normal ) mesh.UserData( tangent.x, tangent.y, tangent.z, 1 ) mesh.TexCoord( 0, u1, v1 ) mesh.Color( 255, 255, 255, alpha ) mesh.AdvanceVertex()
+        mesh.Position( d ) mesh.Normal( normal ) mesh.UserData( tangent.x, tangent.y, tangent.z, 1 ) mesh.TexCoord( 0, u0, v1 ) mesh.Color( 255, 255, 255, alpha ) mesh.AdvanceVertex()
+        mesh.End()
+    end
+
+    function ENT:DrawTranslucent( flags )
+        self:Draw( flags )
+
+        local glow = self.wtGlow or 0
+        if glow <= 0 or #FLAMES == 0 then return end
+
+        if not plumeMat then
+            for _, m in ipairs( self:GetMaterials() ) do
+                if m:find( "jet_flame", 1, true ) then plumeMat = Material( m ) break end
+            end
+
+            if not plumeMat then return end
+        end
+
+        local dir = -self:GetForward()
+        local right, up = self:GetRight(), self:GetUp()
+        local flame = self.wtFlameScale or 0
+
+        for _, f in ipairs( FLAMES ) do
+            local p0 = self:LocalToWorld( f.pos )
+            -- the hot nozzle: always this size, more opaque with thrust
+            local r1, r2 = right * f.radius * 1.05, up * f.radius * 1.05
+            render.SetMaterial( plumeMat )
+            Quad( p0 + r1 + r2, p0 - r1 + r2, p0 - r1 - r2, p0 + r1 - r2, 0.75, 0.75, 1, 1, 255 * glow )
+
+            if flame > 0 then
+                volumeMesh = volumeMesh or BuildVolume()
+                local height = Lerp( flame, VOLUME.minHeight or 7, VOLUME.maxHeight or 10 ) * {VERTEX_SCALE}
+                local transform = Matrix()
+                transform:SetTranslation( p0 )
+                transform:SetAngles( self:GetAngles() )
+                transform:SetScale( Vector( height * flame, {VERTEX_SCALE}, {VERTEX_SCALE} ) )
+                render.SetMaterial( volumeMat )
+                render.SetBlend( flame )
+                cam.PushModelMatrix( transform )
+                volumeMesh:Draw()
+                cam.PopModelMatrix()
+                render.SetBlend( 1 )
+            end
+
+        end
+
+        if HEAT then
+            -- Capture after BOTH nozzle glows/plumes, or refraction overwrites them with the unlit scene.
+            render.UpdateRefractTexture()
+            render.SetMaterial( HEAT )
+            for _, f in ipairs( FLAMES ) do
+                local p0 = self:LocalToWorld( f.pos )
+                -- Camera-facing puffs retain area from behind; an axial ribbon collapses edge-on.
+                for k = 0, 4 do
+                    local t = ( k / 5 + CurTime() * 0.7 ) % 1
+                    local centre = p0 + dir * f.radius * ( 3 + 14 * t )
+                    local size = f.radius * ( 1.2 + t )
+                    local x, y = EyeAngles():Right() * size, EyeAngles():Up() * size
+                    local alpha = 255 * math.sin( math.pi * t ) * math.min( self:GetPower(), 1 ) * ( 0.4 + 0.6 * self.wtThrust )
+                    Quad( centre - x + y, centre + x + y, centre + x - y, centre - x - y, 0, 0, 1, 1, alpha )
+                end
+            end
+        end
+    end
+
+    -- thrust -> p_nozzle
+    local NOZZLE_MAP = {{ {", ".join(f"{{ {a}, {b} }}" for a, b in NOZZLE_MAP)} }}
+
+    local function NozzleParam( x )
+        if x <= NOZZLE_MAP[1][1] then return NOZZLE_MAP[1][2] end
+
+        for i = 2, #NOZZLE_MAP do
+            local a, b = NOZZLE_MAP[i - 1], NOZZLE_MAP[i]
+            if x <= b[1] then return Lerp( ( x - a[1] ) / ( b[1] - a[1] ), a[2], b[2] ) end
+        end
+
+        return NOZZLE_MAP[#NOZZLE_MAP][2]
+    end
+
+    function ENT:OnActivateMisc()
+        BaseClass.OnActivateMisc( self )
+
+        self.wtBones = {{}}
+
+        for _, list in ipairs( {{ SURFACES, WHEELS, PROPS, NOZZLES, FLAMES }} ) do
+            for _, b in ipairs( list ) do
+                self.wtBones[b.bone] = self:LookupBone( b.bone )
+            end
+        end
+
+        self.wtPropSpin = 0
+    end
+
+    local ang = Angle()
+
+    local function Turn( self, bone, axis, degrees )
+        bone = self.wtBones[bone]
+        if not bone then return end
+
+        ang:Zero()
+        ang:RotateAroundAxis( axis, degrees )
+        self:ManipulateBoneAngles( bone, ang, false )
+    end
+
+    function ENT:OnUpdateAnimations()
+        if not self.wtBones then return end
+
+        for _, s in ipairs( SURFACES ) do
+            local getter = self[s.input]
+            Turn( self, s.bone, s.axis, getter and getter( self ) * s.angle or 0 )
+        end
+
+        for _, w in ipairs( WHEELS ) do
+            Turn( self, w.bone, w.axis, self:GetWheelSpin( w.wheel ) or 0 )
+        end
+
+        self.wtPropSpin = ( self.wtPropSpin + self:GetPower() * FrameTime() ) % 360
+
+        for _, p in ipairs( PROPS ) do
+            Turn( self, p.bone, p.axis, ( self.wtPropSpin * p.speed ) % 360 )
+        end
+
+        -- Glide's plane power spools smoothly: 0 off, 1 idle, 2 full throttle (the throttle itself is the raw key input).
+        -- The nozzle glows while the engine runs, the plume grows over the last fifth of thrust. Helicopters keep theirs hidden.
+        local power = self.GetThrottle and self:GetPower() or 0
+        local thrust = math.Clamp( power - 1, 0, 1 )
+        self.wtThrust = thrust
+        self.wtGlow = math.Clamp( power, 0, 1 ) * ( 0.25 + 0.75 * thrust )
+        local targetFlame = math.Clamp( ( thrust - 0.8 ) * 5, 0, 1 )
+        local easing = targetFlame > ( self.wtFlameScale or 0 ) and VOLUME.preNominalEasingParams or VOLUME.postNominalEasingParams
+        local seconds = math.max( ( easing or {{}} ).animationTime or 0.2, 0.01 )
+        self.wtFlameScale = math.Approach( self.wtFlameScale or 0, targetFlame, FrameTime() / seconds )
+
+        for _, f in ipairs( FLAMES ) do -- DrawTranslucent draws them instead
+            local bone = self.wtBones[f.bone]
+            if bone then self:ManipulateBoneScale( bone, vector_origin ) end
+        end
+
+        if #NOZZLES == 0 then return end
+
+        local f = NozzleParam( thrust ) * ( {NOZZLE_SAMPLES} - 1 )
+        if f == self.wtNozzle then return end
+        self.wtNozzle = f
+
+        local i = math.min( math.floor( f ), {NOZZLE_SAMPLES} - 2 )
+        local t = f - i
+
+        for _, n in ipairs( NOZZLES ) do
+            local bone = self.wtBones[n.bone]
+
+            if bone then
+                local a, b = n.frames[i + 1], n.frames[i + 2]
+                self:ManipulateBonePosition( bone, LerpVector( t, a[1], b[1] ), false )
+                self:ManipulateBoneAngles( bone, LerpAngle( t, a[2], b[2] ), false )
+            end
+        end
+    end
+end
+
+if SERVER then
+    ENT.ChassisMass = {mass:.0f}
+    ENT.SpawnPositionOffset = Vector( 0, 0, 60 )
+    ENT.HasLandingGear = {"true" if a2d else "false"} -- gear_up/gear_down sequences baked from the War Thunder animation
+{nl.join(serverLines)}
+
+    -- the camo is in the textures, skip Glide's random paint
+    function ENT:GetSpawnColor()
+        return Color( 255, 255, 255 )
+    end
+
+    function ENT:CreateFeatures()
+{nl.join(seatLines)}
+{nl.join(weaponLines)}
+
+{nl.join(wheelLines)}
+
+        -- the model's own gear shows the wheels
+        for _, w in ipairs( self.wheels ) do
+            Glide.HideEntity( w, true )
+        end
+
+        -- spawn with the gear down (the bind pose has it retracted)
+        if self.HasLandingGear then
+            self:ResetSequence( "gear_down" )
+        end
+    end
+end
+'''
+
+def writeAddon(addonDir:str, className:str, printName:str, modelPath:str, skeleton, blk:dict, tracks:dict = None, options:dict = None, gameRoot:str = None, a2d = None, surfaces:list = None, vtfCmd:str = None):
 	entDir = path.join(addonDir, "lua", "entities")
 	makedirs(entDir, exist_ok = True)
 	sounds = {}
 
-	if gameRoot and blk:
+	if isAircraft(blk):
+		heatTexture = ""
+		if gameRoot and vtfCmd and not isHelicopter(blk):
+			try:
+				heatTexture = exportJetHeat(gameRoot, addonDir, vtfCmd)
+			except Exception as e:
+				log.log(f"War Thunder jet haze unavailable; heat distortion disabled: {e}", 2)
+
+		if gameRoot:
+			sounds = exportAircraftSounds(gameRoot, blk, path.join(addonDir, "sound", "wt", className))
+			volume = (blk.get("AfterBurner0") or {}).get("volumetricAfterBurner")
+			if volume:
+				try:
+					blk = dict(blk, afterburnerRamps = jetVolumeRamps(gameRoot, volume))
+				except Exception as e:
+					log.log(f"Native afterburner color ramp unavailable: {e}", 2)
+		with open(path.join(entDir, f"{className}.lua"), "w", encoding = "utf-8") as f:
+			f.write(generateAircraftLua(className, printName, modelPath, skeleton, blk, a2d, surfaces, heatTexture, sounds))
+	elif gameRoot and blk:
 		try:
 			sounds = exportSounds(gameRoot, blk, path.join(addonDir, "sound", "wt", className))
 		except Exception as e: # the addon still works with Glide's default sounds
 			log.log(f"War Thunder sound export failed: {e}", 2)
 
-	manualYaw = manualTraverseSpeed(gameRoot) if gameRoot else MANUAL_TRAVERSE
+	if not isAircraft(blk):
+		manualYaw = manualTraverseSpeed(gameRoot) if gameRoot else MANUAL_TRAVERSE
 
-	with open(path.join(entDir, f"{className}.lua"), "w", encoding = "utf-8") as f:
-		f.write(generateLua(className, printName, modelPath, skeleton, blk, tracks, options, sounds, manualYaw))
+		with open(path.join(entDir, f"{className}.lua"), "w", encoding = "utf-8") as f:
+			f.write(generateLua(className, printName, modelPath, skeleton, blk, tracks, options, sounds, manualYaw))
 
 	with open(path.join(addonDir, "addon.json"), "w", encoding = "utf-8") as f:
 		json.dump({"title": f"[Glide] {printName}", "type": "entity", "tags": ["fun"], "ignore": []}, f, indent = 4)

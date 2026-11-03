@@ -116,6 +116,7 @@ _ZH_CN = {
 	"Export to Gmod Glide addon": "导出为 Gmod Glide 插件",
 	"Exporting {file} to Gmod Glide": "正在将 {file} 导出到 Gmod Glide",
 	"Writing Glide addon": "正在写入 Glide 插件",
+	"Looking for HQ textures": "正在查找高清贴图",
 	"Extracting War Thunder sounds": "正在提取 War Thunder 音效",
 	"Glide export options": "Glide 导出选项",
 	"Transmission": "传动",

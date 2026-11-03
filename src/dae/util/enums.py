@@ -67,6 +67,9 @@ THEME_LIGHT = "light"
 TEXTURE_GENERIC = 0
 TEXTURE_NORMAL = 1
 TEXTURE_MASKED = 2
+TEXTURE_GLASS = 3
+TEXTURE_JET_FLAME = 4
+JET_PLUME_V = (0.4, 0.6) # texture rows of the painted jet plume, shared by the exporter and the Glide Lua
 
 MVD_NORMAL = 0
 MVD_SKINNED = 1

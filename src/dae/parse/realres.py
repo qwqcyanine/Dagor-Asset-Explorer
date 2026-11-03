@@ -375,6 +375,7 @@ class SourceModel(Terminable):
 		self.__keepBones = keepBones # reduce the skeleton to these bones (+ ancestors), other meshes follow their nearest kept ancestor
 		self.__boneMap = None
 		self.collisionNodeFilter = None # callable(node names) -> names to keep in the collision model
+		self.sequences:dict[str, str] = {} # extra $sequence name -> SMD "nodes ... skeleton ... end" text (30 fps)
 		self.__model:Model = model
 		self.__allLODs:tuple[Model] = allLODs
 		self.__collision:CollisionGeom = collision
@@ -415,6 +416,10 @@ class SourceModel(Terminable):
 
 
 		lines.append('$sequence "idle" "anims/idle.smd" loop')
+
+		for seqName in self.sequences:
+			if seqName != "idle": # an exported neutral pose can replace idle.smd without a duplicate QC sequence
+				lines.append(f'$sequence "{seqName}" "anims/{seqName}.smd" fps 30')
 
 
 		if self.__collision is not None:
@@ -604,6 +609,10 @@ class SourceModel(Terminable):
 		file.write("version 1\n")
 		file.write(skeSMD)
 		file.close()
+
+		for seqName, smd in self.sequences.items():
+			with open(path.join(outdir, f"{seqName}.smd"), "w") as f:
+				f.write("version 1\n" + smd)
 	
 	def writeTinyTriangle(self, outpath:str):
 		log.log("Writing tiny triangle")
@@ -1231,17 +1240,12 @@ class Model(Terminable):
 				mat:MaterialData
 				
 				for tex in SafeIter(self, mat.textures):
-					for i in SafeRange(self, 2): # im lazy
-						if i == 0:
-							texN = mat.checkModifiedName(MaterialData.getTexFileName(tex), texturePaths)
+					base = MaterialData.getTexFileName(tex)
+					masked = mat.checkModifiedName(base, texturePaths)
+					# one material may want the masked copy (_cm) and another the plain texture
+					names = [masked] + ([base] if masked != base and texturePaths.get(base) is not None else [])
 
-							if texN == tex:
-								continue
-						else:
-							tex = tex
-
-							texN = None
-						
+					for texN in names:
 						if texN in exported:
 							continue
 

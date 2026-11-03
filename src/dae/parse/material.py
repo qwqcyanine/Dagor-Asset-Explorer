@@ -218,6 +218,9 @@ class DDSx(Packed):
 		return self.__header.w * self.__header.h
 	
 	def getMipSize(self, width:int, height:int, dxtVersion:bytes):
+		if dxtVersion == b"\x15\x00\x00\x00":
+			return max(1, width) * max(1, height) * 4
+
 		dxtSize = max(1, (width + 3) // 4) * max(1, (height + 3) // 4)
 
 		if dxtVersion == b"DXT1" or dxtVersion == b"ATI1":
@@ -291,6 +294,12 @@ class DDSx(Packed):
 			packInto('I', ddsData, 0x14, self.__header.memSz)
 			packInto('B', ddsData, 0x1c, self.__header.levels)
 			packInto('4s', ddsData, 0x54, d3dformat)
+
+			if d3dformat == b"\x15\x00\x00\x00": # D3DFMT_A8R8G8B8 is BGRA, not a FourCC
+				packInto('<7I', ddsData, 0x50, 0x41, 0, 32, 0xFF0000, 0xFF00, 0xFF, 0xFF000000)
+				packInto('<I', ddsData, 0x08, 0x2100F)
+				packInto('<I', ddsData, 0x14, w * 4)
+				packInto('<I', ddsData, 0x6C, 0x401008 if self.__header.levels > 1 else 0x1000)
 		
 		data = ddsData.raw + data
 
@@ -477,6 +486,37 @@ def addComp(list:list[str], comp:str):
 	if comp is not None:
 		list.append(ftm(comp))
 
+def jetFlameTexture(img:Image.Image):
+	"""War Thunder's aces_weapon_fire shader fades the jet_flame mesh's three crossed plume cards (u 0..0.5, v 0.78..0.97) by
+	saturate(3|N.V| - 0.5), which Source materials can't do; seen end-on they stack into bright discs. Blank the cards and
+	the shock diamond discs, keep the nozzle glow disc, and paint a faint plume at v JET_PLUME_V for a camera facing
+	billboard drawn from Lua."""
+	import numpy as np
+
+	x = np.asarray(img.convert("RGBA")).astype(np.float32)
+	h, w = x.shape[:2]
+	art = x[:, w * 3 // 4:]
+	art[..., :3] *= (1.0, 0.55, 0.3) # the game tints the nozzle glow orange-red through the instance colour
+	# fill the discs (4 stacked in this quarter) so the hot nozzle reads solid, only the hole in the nozzle shows it
+	u, v = np.meshgrid(np.linspace(0, 1, art.shape[1]), np.linspace(0, 4, art.shape[0]))
+	inside = np.clip((0.46 - np.hypot(u - 0.5, v % 1 - 0.5)) * 20, 0, 1)
+	art[..., 3] = np.maximum(art[..., 3], 255 * inside)
+	x[:, :w * 3 // 4] = 0 # the cards and the shock diamond discs (War Thunder barely shows them) draw nothing
+
+	s = np.linspace(0, 1, w // 2)[None, :] # 0 at the nozzle, 1 at the tail
+	radius = 0.5 * (1 - s ** 1.4) ** 0.8 + 1e-3
+	core = np.exp(-6 * s)
+	y0, y1 = int(JET_PLUME_V[0] * h), int(JET_PLUME_V[1] * h)
+	t = np.linspace(-1, 1, y1 - y0)[:, None]
+	across = np.clip(1 - (t / radius) ** 2, 0, 1)
+	hot = across ** 4 * core # a hotter core near the nozzle, a faint pink trail behind
+	x[y0:y1, :w // 2, 0] = 255
+	x[y0:y1, :w // 2, 1] = 110 + 90 * hot
+	x[y0:y1, :w // 2, 2] = 110 + 90 * hot
+	x[y0:y1, :w // 2, 3] = 255 * across ** 1.5 * (1 - s) ** 1.1 * 0.45
+
+	return Image.fromarray(x.clip(0, 255).astype(np.uint8))
+
 def getBestTex(self:Terminable, ddsx:list[DDSx]):
 	best = ddsx[0]
 	
@@ -599,7 +639,10 @@ class MaterialData(Terminable):
 	
 	def __generateName__(self):
 		if len(self.textures) == 0:
-			return self.cls
+			opacity = self.getParams().get("opacity")
+
+			# canopy, gauges and lamp glass differ only by opacity, keep them apart
+			return self.cls if opacity is None else f"{self.cls}_{opacity.replace('.', '')}"
 		
 		components:list[str] = []
 
@@ -700,11 +743,16 @@ class MaterialData(Terminable):
 			img = Image.open(BytesIO(data))
 
 			if texType is not None and texType != TEXTURE_GENERIC:
-				r, g, b, a = img.split()
+				r, g, b, a = img.convert("RGBA").split()
 				img.close()
 
 				if texType == TEXTURE_MASKED:
 					img = Image.merge("RGBA", (r, g, b, invert(a)))
+				elif texType == TEXTURE_GLASS: # War Thunder adds reflections on top, alone the alpha is nearly invisible
+					a = a.point(lambda v: 128 + v // 2)
+					img = Image.merge("RGBA", (r, g, b, a))
+				elif texType == TEXTURE_JET_FLAME:
+					img = jetFlameTexture(Image.merge("RGBA", (r, g, b, a)))
 				elif texType == TEXTURE_NORMAL:
 					whiteChannel = Image.new("L", img.size, 255)
 					img = Image.merge("RGBA", (a, g, whiteChannel, r))
@@ -865,17 +913,22 @@ class MaterialData(Terminable):
 		getScale = lambda x: 1 / float(params.get(x)) if x in params else 1
 
 		vmt = self.getVMTcomments()
+		shader = "VertexLitGeneric"
 
 		if self.diffuse is not None:
 			texType = TEXTURE_GENERIC
 			
 			if self.cls.find("masked") != -1:
 				texType = TEXTURE_MASKED
+			elif self.cls.find("glass") != -1:
+				texType = TEXTURE_GLASS
+			elif self.cls == "aces_weapon_fire" and "jet_flame" in self.diffuse:
+				texType = TEXTURE_JET_FLAME
 			
 			diffuse = texturePaths.append(self.diffuse, texType, vmt, "basetexture")
 
 			if self.detail1IsDiffuse():
-				vmt.append(f"$basetexturetransform center .5 .5 scale {getScale('detail1_tile_u')} {getScale('detail1_tile_v')} rotate 0 translate 0 0")
+				vmt.append(f"$basetexturetransform \"center .5 .5 scale {getScale('detail1_tile_u')} {getScale('detail1_tile_v')} rotate 0 translate 0 0\"")
 		else:
 			diffuse = None
 
@@ -895,11 +948,12 @@ class MaterialData(Terminable):
 		else:
 			tileParam = "mask"
 
-		if mask is not None:
+		# detail normal maps (aircraft_normal_detail_n) and chrome reflection cubemaps as $detail paint the model purple
+		if mask is not None and not MaterialData.getTexFileName(mask).endswith("_n") and "cubemap" not in mask:
 			texturePaths.append(mask, TEXTURE_GENERIC, vmt, "detail")
 
 			vmt.append("$detailblendmode 4")
-			vmt.append(f"$detailscale [{getScale(f'{tileParam}_tile_u')} {getScale(f'{tileParam}_tile_v')}]")
+			vmt.append(f"$detailscale \"[{getScale(f'{tileParam}_tile_u')} {getScale(f'{tileParam}_tile_v')}]\"") # unquoted, KeyValues splits it at the space
 
 			if self.isLayered():
 				vmt.append("$detailblendfactor 0.5")
@@ -912,19 +966,37 @@ class MaterialData(Terminable):
 			if gamma is not None:
 				gamma = float(gamma) * 2
 
-				vmt.append(f"$detailtint {'{'} {gamma} {gamma} {gamma} {'}'}")
+				vmt.append(f'$detailtint "[{gamma} {gamma} {gamma}]"')
 
 
 		if self.cls.find("glass") != -1:
 			vmt.append("$translucent 1")
 			vmt.append("$nocull 1")
+
+			vmt.append('$envmap "env_cubemap"')
+			vmt.append('$envmaptint "[0.3 0.3 0.3]"')
+
+			if diffuse is None: # untextured canopy glass: light tint at War Thunder's opacity
+				vmt.append('$color2 "[0.75 0.8 0.85]"')
+				# studio models overwrite $alpha with the entity alpha every draw, a proxy sets it back afterwards
+				vmt.append(f"$wtopacity {params.get('opacity', '0.3')}")
+				vmt.append('Proxies\n\t{\n\t\tEquals\n\t\t{\n\t\t\tsrcVar1 "$wtopacity"\n\t\t\tresultVar "$alpha"\n\t\t}\n\t}')
+		elif self.cls == "aces_weapon_fire": # muzzle flashes and jet flames glow
+			vmt.append("$additive 1")
+			vmt.append("$nocull 1")
+			shader = "UnlitGeneric"
+
+			if "jet_flame" in (self.diffuse or ""): # only the shock diamond discs are opaque, the rest is War Thunder shader work
+				vmt.append("$translucent 1")
+				vmt.append("$vertexalpha 1") # Lua fades the nozzle glow by thrust
+				vmt.append("$vertexcolor 1")
 		elif ("atest" in params and params["atest"] != "128") or self.cls.find("atest") != -1:
 			vmt.append("$alphatest 1")
 			vmt.append("$nocull 1")
 		elif "two_sided" in params:
 			vmt.append("$nocull 1")
 
-		fullVMT = "\n".join(('"VertexLitGeneric"', "{", "\t" + "\n\t".join(vmt), "}"))
+		fullVMT = "\n".join((f'"{shader}"', "{", "\t" + "\n\t".join(vmt), "}"))
 
 		return fullVMT
 

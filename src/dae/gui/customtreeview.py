@@ -18,7 +18,9 @@ from functools import partial
 from parse.material import DDSx, DDSxTexturePack2
 from parse.realres import RendInst, DynModel, ModelContainer, GeomNodeTree
 from gui.glideOptionsDialog import GlideOptionsDialog
-from util.glide import GLIDE_KEEP_BONES, TRACK_R_SUFFIX, defaultOptions, findGameRoot, findTankBlk, glideCollisionNodes, hiddenNodes, splitTrackMaterials, writeAddon
+from util.glide import GLIDE_KEEP_BONES, TRACK_R_SUFFIX, cacheHQTextures, defaultOptions, findGameRoot, findTankBlk, glideCollisionNodes, hiddenNodes, splitTrackMaterials, writeAddon
+from util.glide import aircraftCollisionNodes, aircraftHiddenNodes, aircraftKeepBones, controlSurfaces, findAircraftBlk, findAircraftCollision, gearSequences, isAircraft
+from util.a2d import A2D
 import re
 from parse.gameres import GameResourcePack
 from traceback import format_exc
@@ -793,7 +795,26 @@ class ExportToGlide(ExportToSource):
 
 	def preRun(self):
 		asset:DynModel = self.item.asset
-		self.blk = findTankBlk(asset.filePath, asset.name)
+		self.blk = findAircraftBlk(asset.filePath, asset.name) or findTankBlk(asset.filePath, asset.name)
+		self.a2d = self.surfaces = None
+
+		if isAircraft(self.blk):
+			asset.computeData()
+
+			if asset.collision is None:
+				asset.setCollisionGeom(findAircraftCollision(asset.filePath, asset.name))
+
+			self.keepBones = aircraftKeepBones(asset.geomNodeTree)
+
+			try:
+				self.a2d = A2D.fromPack(asset.filePath, f"{asset.name}_anim")
+			except Exception as e: # no gear animation then, the gear stays as modelled
+				log.log(f"War Thunder animation unreadable: {e}", 2)
+
+			self.options = {}
+
+			return super().preRun()
+
 		dialog = GlideOptionsDialog(self.mainWindow, defaultOptions(self.blk))
 
 		if dialog.exec_() != QDialog.Accepted:
@@ -804,12 +825,25 @@ class ExportToGlide(ExportToSource):
 		return super().preRun()
 
 	def prepareSourceModel(self, smdl):
+		if isAircraft(self.blk):
+			smdl.collisionNodeFilter = aircraftCollisionNodes
+			smdl.model.removeObjects(aircraftHiddenNodes([o.name for o in smdl.model], self.blk))
+			self.surfaces = controlSurfaces(smdl.model)
+			self.tracks = {"l": ((), 0.0), "r": ((), 0.0)}
+
+			if self.a2d:
+				smdl.sequences.update(gearSequences(smdl.model.skeleton, self.keepBones, self.a2d, self.blk.get("fm")))
+
+			return
+
 		smdl.collisionNodeFilter = glideCollisionNodes
 		smdl.model.removeObjects(hiddenNodes(self.blk, self.options["upgraded"]))
 		self.tracks = splitTrackMaterials(smdl.model)
 
 	def save(self, output:str):
 		asset:DynModel = self.item.asset
+		self.setTaskStatus(tr("Looking for HQ textures"))
+		log.log(f"Cached {cacheHQTextures(findGameRoot(asset.filePath), asset.textures)} HQ textures")
 		super().save(output)
 
 		if self.shouldTerminate:
@@ -836,7 +870,7 @@ class ExportToGlide(ExportToSource):
 
 		skeleton = self.smdl.model.skeleton
 		self.setTaskStatus(tr("Extracting War Thunder sounds"))
-		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk, self.tracks, self.options, findGameRoot(asset.filePath))
+		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk, self.tracks, self.options, findGameRoot(asset.filePath), self.a2d, self.surfaces, SETTINGS.getValue(SETTINGS_VTFCMD_PATH) or VTFCMD_PATH)
 		log.log(f"Glide addon written to {addonDir}")
 
 class ExportLODsToSource(ExportToSource):
