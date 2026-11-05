@@ -517,3 +517,31 @@ class AircraftTest(unittest.TestCase):
         names = ["fuse", "fuse4", "pylon1", "flare3", "prop01_1", "prop02_1", "prop01_1_dmg", "jet_flame"]
         self.assertEqual(aircraftHiddenNodes(names, blk), {"pylon1", "flare3", "prop02_1", "prop01_1_dmg"}) # jet_flame stays, scaled with thrust
         self.assertEqual(aircraftCollisionNodes(["fuse_dm", "wing1_l_dm", "tank3_dm", "gear_l_dm", "wingcontrol_dm"]), {"fuse_dm", "wing1_l_dm"})
+
+    def test_remove_objects_prunes_unused_materials(self):
+        from types import SimpleNamespace
+        mdl = Model("plane", materials=(SimpleNamespace(getName=lambda: "body_mat"), SimpleNamespace(getName=lambda: "prop_mat")))
+        body = mdl.newObject("fuse")
+        body.appendMaterial("body_mat")
+        prop = mdl.newObject("prop02_1")
+        prop.appendMaterial("prop_mat")
+        mdl.removeObjects({"prop02_1"})
+        self.assertEqual([m.getName() for m in mdl.materials], ["body_mat"])
+
+    def test_find_aircraft_blk_matches_hyphenated_and_model_field(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from util.glide import findAircraftBlk, defaultOptions
+        files = {
+            "gamedata/flightmodels/bf-109a_1.blk": {"model": "bf_109a_1"},
+            "gamedata/flightmodels/fm/bf-109a_1.blk": {"Mass": {"EmptyMass": 1900.0, "MaxFuelMass0": 177.0}},
+            "gamedata/flightmodels/ef_2000a.blk": {"model": "f_2000a", "fmFile": "fm/f_2000a.blk"},
+            "gamedata/flightmodels/fm/f_2000a.blk": {"Mass": {"EmptyMass": 11000.0, "MaxFuelMass0": 4000.0}},
+        }
+        vfs = SimpleNamespace(files=set(files), readBlk=lambda k: dict(files[k]))
+        with patch("util.glide.findGameRoot", return_value="root"), patch("util.glide.VROMFS", return_value=vfs):
+            bf = findAircraftBlk("root/res/aircrafts/germ_bf_109.grp", "bf_109a_1")
+            ef = findAircraftBlk("root/res/aircrafts/air.grp", "f_2000a")
+        self.assertEqual(bf["fm"]["Mass"]["EmptyMass"], 1900.0)
+        self.assertEqual(ef["fm"]["Mass"]["EmptyMass"], 11000.0)
+        self.assertEqual(defaultOptions(bf), {"aircraft": True, "helicopter": False, "mass": 2077.0, "maxSpeed": 2400.0, "engineForce": 350.0})

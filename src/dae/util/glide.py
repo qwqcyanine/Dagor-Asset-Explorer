@@ -34,7 +34,18 @@ GLIDE_POWER_SPLIT = 0.5
 BUMP_TRAVEL = 10.0
 
 def defaultOptions(blk:dict):
-	"""Export options the user can edit, prefilled from the War Thunder tank blk."""
+	"""Export options the user can edit, prefilled from the War Thunder vehicle blk."""
+	if isAircraft(blk):
+		fm = (blk or {}).get("fm") or {}
+
+		return {
+			"aircraft": True,
+			"helicopter": isHelicopter(blk),
+			"mass": aircraftMass(fm),
+			"maxSpeed": 2400.0,
+			"engineForce": 350.0,
+		}
+
 	blk = blk or {}
 	phys = blk.get("VehiclePhys", {})
 	mass = phys.get("Mass", {}).get("TakeOff", blk.get("mass", 20000))
@@ -137,15 +148,19 @@ def findGameRoot(assetPath:str):
 	return d
 
 def cacheHQTextures(gameRoot:str, textures:list[str]):
-	"""Cache the full resolution copies War Thunder keeps in content.hq; the export picks the largest cached DDSx per name."""
+	"""Cache the full resolution copies War Thunder keeps in content.hq (and starter *-hq packs in content/base); the export picks the largest cached DDSx per name."""
 	from glob import glob
 	from parse.material import DDSxTexturePack2
 	from util.assetcacher import AssetCacher
 
 	want = {t.split("*")[0] for t in textures or ()}
 	found = 0
+	packs = (
+		glob(path.join(gameRoot or "", "content.hq", "hq_tex", "res", "**", "*.dxp.bin"), recursive = True) +
+		glob(path.join(gameRoot or "", "content", "base", "res", "**", "*-hq.dxp.bin"), recursive = True)
+	) if want else ()
 
-	for f in glob(path.join(gameRoot or "", "content.hq", "hq_tex", "res", "**", "*.dxp.bin"), recursive = True) if want else ():
+	for f in packs:
 		try:
 			for tex in DDSxTexturePack2(f).getPackedFiles():
 				# re-exports would cache the same copy again
@@ -1053,15 +1068,34 @@ def findAircraftBlk(assetPath:str, modelName:str):
 		return None
 
 	vfs = VROMFS(path.join(d, "aces.vromfs.bin"))
-	name = f"gamedata/flightmodels/{modelName.lower()}.blk"
+	low = modelName.lower()
+	norm = low.replace("-", "_")
+	name = f"gamedata/flightmodels/{low}.blk"
+	fmFiles = [f for f in vfs.files if f.startswith("gamedata/flightmodels/") and f.count("/") == 2 and f.endswith(".blk")]
 
 	if name not in vfs.files:
+		name = next((f for f in fmFiles if path.basename(f)[:-4].replace("-", "_") == norm), None)
+
+	blk = vfs.readBlk(name) if name else None
+
+	if blk is None:
+		for f in fmFiles:
+			try:
+				b = vfs.readBlk(f)
+			except Exception:
+				continue
+
+			if str(b.get("model", "")).lower().replace("-", "_") == norm:
+				name, blk = f, b
+				break
+
+	if blk is None:
 		return None
 
-	blk = vfs.readBlk(name)
+	fmFile = str(blk.get("fmFile") or f"fm/{path.basename(name)}").lower()
 
 	try:
-		blk["fm"] = vfs.readBlk(f"gamedata/flightmodels/{str(blk['fmFile']).lower()}")
+		blk["fm"] = vfs.readBlk(f"gamedata/flightmodels/{fmFile}")
 	except (KeyError, ValueError):
 		blk["fm"] = {}
 
@@ -1119,7 +1153,7 @@ def aircraftCollisionNodes(names:list[str]):
 	return {n for n in names if AIRCRAFT_SKIN_RE.fullmatch(n)} or set(names)
 
 def aircraftKeepBones(skeleton):
-	return {n.name for n in skeleton.getNodes() if AIRCRAFT_BONE_RE.fullmatch(n.name)}
+	return {n.name for n in skeleton.getNodes() if AIRCRAFT_BONE_RE.fullmatch(n.name)} if skeleton else set()
 
 def _mat(tm):
 	import numpy as np
@@ -1340,18 +1374,23 @@ def exportAircraftSounds(gameRoot:str, blk:dict, outDir:str):
 	if not path.isfile(path.join(soundDir, "masterbank.strings.bank")):
 		return {}
 	strings = readStrings(path.join(soundDir, "masterbank.strings.bank"))
+	stringsLower = {k.lower(): (k, v) for k, v in strings.items()}
+	try:
+		studio = VROMFS(path.join(gameRoot, "aces.vromfs.bin")).readBlk("config/sound_studio.blk")
+	except Exception:
+		studio = {}
 	makedirs(outDir, exist_ok = True)
 	out, banks, sources = {"guns": {}}, {}, {}
 
 	def resolve(bankName, event):
-		guid = strings.get(event)
+		canonical, guid = stringsLower.get(event.lower(), (event, None))
 		if not guid:
 			raise ValueError(f"Missing FMOD event {event}")
 		if bankName not in banks:
 			banks[bankName] = SoundBank(soundDir, bankName)
 		bank = banks[bankName]
 		bank.decode(bank.walk(guid))
-		return bank, guid
+		return bank, guid, canonical
 
 	def save(stem, pcm, loop = False):
 		if not len(pcm) or np.max(np.abs(pcm)) < 1e-6:
@@ -1359,6 +1398,7 @@ def exportAircraftSounds(gameRoot:str, blk:dict, outDir:str):
 		writeWav(path.join(outDir, stem + ".wav"), finish(pcm), SOURCE_RATE, loop)
 		return stem
 
+	norm = lambda s: s.lower().replace("_", "").replace("-", "")
 	for w in aircraftWeapons(blk):
 		ref = w.get("blk", "")
 		if ref in out["guns"] or w.get("trigger") not in ("cannon", "machinegun", "guns"):
@@ -1366,12 +1406,21 @@ def exportAircraftSounds(gameRoot:str, blk:dict, outDir:str):
 		cfg = w.get("weaponBlk", {}).get("gunSound", {})
 		event = f'event:/{cfg.get("pathStudio", "")}/{cfg.get("outside", "")}'
 		try:
-			bank, guid = resolve("aircraft_guns", event)
+			bank, guid, event = resolve("aircraft_guns", event)
 			# shortcut: per-shot close samples, not FMOD's distance/cone/first-last-shot mixer.
-			shotName = cfg["outside"].removesuffix("_outside").removeprefix("cannon_")
-			shots = sorted((bank.sample(bank.waves[i.wave])[0], g) for g in bank.walk(guid)
-				if (i := bank.instruments.get(g)) and i.wave in bank.waves
-				and bank.sample(bank.waves[i.wave])[0].startswith(shotName + "_close-"))
+			stem = norm(re.sub(r"^(cannon_|gun_)|(_gun)?_outside$", "", str(cfg.get("outside", ""))))
+			pairs = [(bank.sample(bank.waves[i.wave])[0], g) for g in bank.walk(guid)
+				if (i := bank.instruments.get(g)) and i.wave in bank.waves]
+			groups = (
+				[p for p in pairs if re.search(r"(?:^|_)(?<!first_)(?<!last_)close-\d+$", p[0])],
+				[p for p in pairs if re.search(r"(?:^|_)(?<!start_)(?<!end_)(?<!last_)(?:shot|singleshot|fast)[-_]\d+$", p[0]) and not p[0].startswith("body_")],
+				[p for p in pairs if re.search(r"(?:^|_)(?:first_close|start_shot|first|start)[-_]\d+$", p[0]) and "far" not in p[0]],
+			)
+			shots = []
+			for grp in groups:
+				if grp:
+					shots = sorted([p for p in grp if norm(p[0]).startswith(stem)] or [p for p in grp if norm(p[0]).startswith(stem[:4])] or grp)
+					break
 			if not shots:
 				raise ValueError(f"No single-shot close samples in {event}")
 			renderer = Renderer(bank, {"on_shot": 1})
@@ -1384,7 +1433,7 @@ def exportAircraftSounds(gameRoot:str, blk:dict, outDir:str):
 	engine = (blk.get("Sound") or {}).get("Engine")
 	if engine and isHelicopter(blk):
 		try:
-			cfg = VROMFS(path.join(gameRoot, "aces.vromfs.bin")).readBlk("config/sound_studio.blk")[engine]
+			cfg = studio[engine]
 			loops, provenance = [], []
 			for group in ("engines", "propellers"):
 				outside = cfg[group]["outside"]
@@ -1393,7 +1442,7 @@ def exportAircraftSounds(gameRoot:str, blk:dict, outDir:str):
 					raise ValueError(f"Missing {group} events for {engine}")
 				for key, name in events:
 					event = f'event:/{outside["path"]}/{name}'
-					bank, guid = resolve("aircraft_engines", event)
+					bank, guid, event = resolve("aircraft_engines", event)
 					# shortcut: healthy nominal-RPM exterior mix; add live FMOD controllers for cockpit/load/distance fidelity.
 					params = {"load": 0.5, "broken": 0, "rotor_broken": 0, "depth": -1000, "Distance": 0}
 					for layout in bank.events[guid].layouts:
@@ -1410,23 +1459,31 @@ def exportAircraftSounds(gameRoot:str, blk:dict, outDir:str):
 		except Exception as e:
 			log.log(f"Helicopter sound unavailable ({engine}): {e}", 2)
 	if engine and not isHelicopter(blk):
-		event = f"event:/aircraft/engines/{engine}"
+		engCfg = (studio.get(engine) or {}) if isinstance(studio.get(engine), dict) else {}
+		outside = engCfg.get("outside") or (engCfg.get("engines") or {}).get("outside") or {}
+		evName = outside.get("eventBack") or outside.get("eventLod1") or engine
+		evPath = outside.get("path", "aircraft/engines")
+		event = f"event:/{evPath}/{evName}"
 		try:
-			bank, guid = resolve("aircraft_engines", event)
+			bank, guid, event = resolve("aircraft_engines", event)
 			# shortcut: three native FMOD operating points crossfaded by power; not the complete RPM/distance simulation.
 			loops = {}
 			for key, rpm, wep in (("idle", 1000, 0), ("full", 2500, 0), ("wep", 2500, 1)):
-				loops[key] = save(f"engine_{key}", Renderer(bank, {"rpm": rpm, "wep": wep, "distance": 0, "depth": -1000}).event(guid, 8), True)
+				params = {"rpm": rpm, "wep": wep, "distance": 0, "Distance": 0, "depth": -1000, "load": 0.5}
+				for layout in bank.events[guid].layouts:
+					pname = bank.params.get(bank.layouts[layout][0], ("",))[0]
+					if pname.startswith("rpm"):
+						params[pname] = rpm
+				loops[key] = save(f"engine_{key}", Renderer(bank, params).event(guid, 8), True)
 			out["engine"] = loops
 			sources["engine"] = {"event": event, "operatingPoints": [[1000, 0], [2500, 0], [2500, 1]]}
 		except Exception as e:
 			log.log(f"Aircraft engine sound unavailable ({engine}): {e}", 2)
 
 	try:
-		cfg = VROMFS(path.join(gameRoot, "aces.vromfs.bin")).readBlk("config/sound_studio.blk")
 		# WT calls the common aircraft landing-gear event 'chasis' (one s).
-		event = "event:/" + cfg["misc_effects"]["path"] + "/" + cfg["misc_effects"]["eventChasis"]
-		bank, guid = resolve("aircraft_effects", event)
+		event = "event:/" + studio["misc_effects"]["path"] + "/" + studio["misc_effects"]["eventChasis"]
+		bank, guid, event = resolve("aircraft_effects", event)
 		renderer = Renderer(bank)
 		parts = {}
 		for g in bank.walk(guid):
@@ -1502,14 +1559,17 @@ def exportJetHeat(gameRoot:str, addonDir:str, vtfCmd:str):
 
 	return "models/wt_glide/fx/distortion_hot_air_a_normal"
 
-def generateAircraftLua(className:str, printName:str, modelPath:str, skeleton, blk:dict, a2d = None, surfaces:list = None, heatTexture:str = "", sounds:dict = None):
+def generateAircraftLua(className:str, printName:str, modelPath:str, skeleton, blk:dict, a2d = None, surfaces:list = None, heatTexture:str = "", sounds:dict = None, options:dict = None):
 	fm = blk.get("fm") or {}
+	options = {**defaultOptions(blk), **(options or {})}
 	sounds = sounds or {}
 	soundDir = f"wt/{className}"
 	heli = isHelicopter(blk)
 	base = "base_glide_heli" if heli else "base_glide_plane"
 	node = skeleton.getNodeByName
-	mass = aircraftMass(fm)
+	mass = min(float(options.get("mass", aircraftMass(fm))), 50000)
+	maxSpeed = float(options.get("maxSpeed", 2400))
+	engineForce = float(options.get("engineForce", 350))
 	positions = [gamePos(n) for n in skeleton.getNodes()]
 	length = max(float(fm.get("Length", 0)) * VERTEX_SCALE, max(p[0] for p in positions) - min(p[0] for p in positions), 100.0)
 	rot = (length / AIRCRAFT_REF_LENGTH) ** 2
@@ -1597,9 +1657,9 @@ def generateAircraftLua(className:str, printName:str, modelPath:str, skeleton, b
 			"    ENT.SteerConeMaxSpeed = 900",
 			"    ENT.PlaneParams = {",
 			f"        liftAngularDrag = Vector( {-20 * rot:.0f}, {-70 * rot:.0f}, {-100 * rot:.0f} ), -- (Roll, pitch, yaw)",
-			"        maxSpeed = 2400,",
-			"        liftSpeed = 1800,",
-			"        engineForce = 350,",
+			f"        maxSpeed = {maxSpeed:.0f},",
+			f"        liftSpeed = {maxSpeed * 0.75:.0f},",
+			f"        engineForce = {engineForce:.0f},",
 			f"        pitchForce = {5500 * rot:.0f},",
 			f"        yawForce = {3500 * rot:.0f},",
 			f"        rollForce = {3500 * rot:.0f}",
@@ -2083,7 +2143,7 @@ def writeAddon(addonDir:str, className:str, printName:str, modelPath:str, skelet
 				except Exception as e:
 					log.log(f"Native afterburner color ramp unavailable: {e}", 2)
 		with open(path.join(entDir, f"{className}.lua"), "w", encoding = "utf-8") as f:
-			f.write(generateAircraftLua(className, printName, modelPath, skeleton, blk, a2d, surfaces, heatTexture, sounds))
+			f.write(generateAircraftLua(className, printName, modelPath, skeleton, blk, a2d, surfaces, heatTexture, sounds, options))
 	elif gameRoot and blk:
 		try:
 			sounds = exportSounds(gameRoot, blk, path.join(addonDir, "sound", "wt", className))

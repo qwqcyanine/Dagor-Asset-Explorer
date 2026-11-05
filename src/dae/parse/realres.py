@@ -775,6 +775,10 @@ class Model(Terminable):
 	def removeObjects(self, names:set[str]):
 		self.__objects = [o for o in self.__objects if o.name not in names]
 
+		if self.__materials is not None and self.__objects:
+			used = {m for o in self.__objects for m in o.materials.values()}
+			self.__materials = tuple(m for m in self.__materials if m.getName() in used)
+
 	def newObject(self, name:str, skinned:bool = False):
 		obj = self.Object(name, skinned)
 

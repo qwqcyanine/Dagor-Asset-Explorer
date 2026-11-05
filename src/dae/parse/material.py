@@ -33,8 +33,8 @@ class DDSx(Packed):
 			self.d3dformat = file.read(4)
 			self.flags = readEx(3, file)
 			self.cMethod = readByte(file)
-			self.h = readShort(file)
 			self.w = readShort(file)
+			self.h = readShort(file)
 
 			self.levels = readByte(file)
 			self.hqPartLevels = readByte(file)
@@ -100,7 +100,8 @@ class DDSx(Packed):
 		b"DXT1",
 		b"DXT5",
 		b"BC7 ",
-		b"ATI1")
+		b"ATI1",
+		b"ATI2")
 
 	__DDS_HEADER = (
 		0x44, 0x44, 0x53, 0x20, 0x7C, 0x00, 0x00, 0x00,
@@ -218,14 +219,16 @@ class DDSx(Packed):
 		return self.__header.w * self.__header.h
 	
 	def getMipSize(self, width:int, height:int, dxtVersion:bytes):
-		if dxtVersion == b"\x15\x00\x00\x00":
+		if dxtVersion in (b"\x15\x00\x00\x00", b" \x00\x00\x00"):
 			return max(1, width) * max(1, height) * 4
+		elif dxtVersion in (b"2\x00\x00\x00", b"\x1c\x00\x00\x00"):
+			return max(1, width) * max(1, height)
 
 		dxtSize = max(1, (width + 3) // 4) * max(1, (height + 3) // 4)
 
 		if dxtVersion == b"DXT1" or dxtVersion == b"ATI1":
 			return dxtSize * 8
-		elif dxtVersion == b"DXT5" or dxtVersion == b"BC7 ":
+		elif dxtVersion in (b"DXT5", b"BC7 ", b"ATI2"):
 			return dxtSize * 16
 		else:
 			log.log(f"Unknown DXT version {dxtVersion}, using DXT1 scale", LOG_WARN)
@@ -280,8 +283,8 @@ class DDSx(Packed):
 			ddsData = create_string_buffer(0x94)
 
 			packInto('148B', ddsData, 0, *self.__DDS_2_HEADER)
-			packInto('I', ddsData, 0xc, w)
-			packInto('I', ddsData, 0x10, h)
+			packInto('I', ddsData, 0xc, h)
+			packInto('I', ddsData, 0x10, w)
 			packInto('I', ddsData, 0x14, self.__header.memSz)
 			packInto('B', ddsData, 0x1c, self.__header.levels)
 			packInto('4s', ddsData, 0x54, b"DX10")
@@ -289,8 +292,8 @@ class DDSx(Packed):
 			ddsData = create_string_buffer(0x80)
 
 			packInto('128B', ddsData, 0, *self.__DDS_HEADER)
-			packInto('I', ddsData, 0xc, w)
-			packInto('I', ddsData, 0x10, h)
+			packInto('I', ddsData, 0xc, h)
+			packInto('I', ddsData, 0x10, w)
 			packInto('I', ddsData, 0x14, self.__header.memSz)
 			packInto('B', ddsData, 0x1c, self.__header.levels)
 			packInto('4s', ddsData, 0x54, d3dformat)
@@ -299,6 +302,16 @@ class DDSx(Packed):
 				packInto('<7I', ddsData, 0x50, 0x41, 0, 32, 0xFF0000, 0xFF00, 0xFF, 0xFF000000)
 				packInto('<I', ddsData, 0x08, 0x2100F)
 				packInto('<I', ddsData, 0x14, w * 4)
+				packInto('<I', ddsData, 0x6C, 0x401008 if self.__header.levels > 1 else 0x1000)
+			elif d3dformat == b" \x00\x00\x00": # D3DFMT_A8B8G8R8 is RGBA, not a FourCC
+				packInto('<7I', ddsData, 0x50, 0x41, 0, 32, 0xFF, 0xFF00, 0xFF0000, 0xFF000000)
+				packInto('<I', ddsData, 0x08, 0x2100F)
+				packInto('<I', ddsData, 0x14, w * 4)
+				packInto('<I', ddsData, 0x6C, 0x401008 if self.__header.levels > 1 else 0x1000)
+			elif d3dformat in (b"2\x00\x00\x00", b"\x1c\x00\x00\x00"): # D3DFMT_L8 (50) / D3DFMT_A8 (28): 8-bit single-channel
+				packInto('<7I', ddsData, 0x50, 0x20000, 0, 8, 0xFF, 0, 0, 0)
+				packInto('<I', ddsData, 0x08, 0x2100F)
+				packInto('<I', ddsData, 0x14, w)
 				packInto('<I', ddsData, 0x6C, 0x401008 if self.__header.levels > 1 else 0x1000)
 		
 		data = ddsData.raw + data
@@ -574,7 +587,7 @@ class TexturePathDict:
 		cachedDDSx = AssetCacher.getCachedAsset(DDSx, texName)
 
 		if cachedDDSx:
-			cachedDDSx:DDSx = cachedDDSx[0]
+			cachedDDSx:DDSx = max(cachedDDSx, key = lambda d: d.getPixelCnt())
 
 			return f"{self.customPath}/{cachedDDSx.getParentName()}"
 		else:
@@ -728,9 +741,10 @@ class MaterialData(Terminable):
 
 	def convertTex(self, texture:str, data:bytes, texturePaths:TexturePathDict = None, forceConvert:bool = False, texN:str = None):
 		newName = None
+		key = MaterialData.getTexFileName(texture) if texN is None else texN
 
-		if texturePaths is not None and texturePaths.get(texture if texN is None else texN) is not None:
-			tex = texturePaths.get(texture if texN is None else texN)
+		if texturePaths is not None and texturePaths.get(key) is not None:
+			tex = texturePaths.get(key)
 
 			texType = tex.texType
 

@@ -646,6 +646,10 @@ class ExportToSource(SaveAction):
 		
 		if self.handleTermination(smdl):
 			return
+
+		if exportTex:
+			self.setTaskStatus(tr("Looking for HQ textures"))
+			log.log(f"Cached {cacheHQTextures(findGameRoot(asset.filePath), getattr(asset, 'textures', None))} HQ textures")
 		
 		self.setTaskStatus(tr("Exporting model data to QC, SMD and VMT"))
 		qc, texturePaths = smdl.export(output, modelPath, exportCollisionModel, exportSMDs)
@@ -797,9 +801,25 @@ class ExportToGlide(ExportToSource):
 		asset:DynModel = self.item.asset
 		self.blk = findAircraftBlk(asset.filePath, asset.name) or findTankBlk(asset.filePath, asset.name)
 		self.a2d = self.surfaces = None
+		asset.computeData()
 
-		if isAircraft(self.blk):
-			asset.computeData()
+		if self.blk is None and asset.geomNodeTree is not None and aircraftKeepBones(asset.geomNodeTree) and not asset.geomNodeTree.getNodeByName("bone_turret"):
+			heli = asset.geomNodeTree.getNodeByName("prop01_2") is not None and not any(n.name.startswith("aileron") for n in asset.geomNodeTree.getNodes())
+			self.blk = {"fm": {}, **({"helicopter": True} if heli else {})}
+
+		dialog = GlideOptionsDialog(self.mainWindow, defaultOptions(self.blk))
+
+		if dialog.exec_() != QDialog.Accepted:
+			return False
+
+		self.options = dialog.options()
+
+		if self.options.get("aircraft", isAircraft(self.blk)):
+			self.blk = dict(self.blk or {}, fm = (self.blk or {}).get("fm") or {})
+			if self.options.get("helicopter"):
+				self.blk["helicopter"] = True
+			else:
+				self.blk.pop("helicopter", None)
 
 			if asset.collision is None:
 				asset.setCollisionGeom(findAircraftCollision(asset.filePath, asset.name))
@@ -810,17 +830,8 @@ class ExportToGlide(ExportToSource):
 				self.a2d = A2D.fromPack(asset.filePath, f"{asset.name}_anim")
 			except Exception as e: # no gear animation then, the gear stays as modelled
 				log.log(f"War Thunder animation unreadable: {e}", 2)
-
-			self.options = {}
-
-			return super().preRun()
-
-		dialog = GlideOptionsDialog(self.mainWindow, defaultOptions(self.blk))
-
-		if dialog.exec_() != QDialog.Accepted:
-			return False
-
-		self.options = dialog.options()
+		elif isAircraft(self.blk):
+			self.blk = None
 
 		return super().preRun()
 
@@ -842,8 +853,6 @@ class ExportToGlide(ExportToSource):
 
 	def save(self, output:str):
 		asset:DynModel = self.item.asset
-		self.setTaskStatus(tr("Looking for HQ textures"))
-		log.log(f"Cached {cacheHQTextures(findGameRoot(asset.filePath), asset.textures)} HQ textures")
 		super().save(output)
 
 		if self.shouldTerminate:

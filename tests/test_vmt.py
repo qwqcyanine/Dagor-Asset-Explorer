@@ -35,6 +35,46 @@ class DDSxTest(unittest.TestCase):
         self.assertEqual(img.getpixel((3, 3)), (70, 80, 90, 255))
         self.assertEqual(dds[-4:], bytes((30, 20, 10, 255)))
 
+    def test_l8_a8_rgba_and_ati2_reversed_mips_export_as_dds(self):
+        from io import BytesIO
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from PIL import Image
+        from parse.material import DDSx
+
+        for fmt in (b"2\0\0\0", b"\x1c\0\0\0"): # D3DFMT_L8 (50) and D3DFMT_A8 (28)
+            header = SimpleNamespace(w=4, h=2, d3dformat=fmt, flags=0x40000,
+                                     cMethod=0, levels=3, memSz=11, packedSz=11)
+            tex = DDSx("propmask.ddsx", size=11, header=header)
+            raw = bytes((11,)) + bytes((22,)) * 2 + bytes((200,)) * 8
+            with patch.object(tex, "getData", return_value=raw):
+                dds = tex.getDDS()
+            img = Image.open(BytesIO(dds))
+            self.assertEqual(img.size, (4, 2))
+            self.assertEqual(img.getpixel((3, 1)), 200)
+            self.assertEqual(dds[-1:], bytes((11,)))
+
+        # D3DFMT_A8B8G8R8 (32)
+        header = SimpleNamespace(w=4, h=2, d3dformat=b" \0\0\0", flags=0x40000,
+                                 cMethod=0, levels=3, memSz=44, packedSz=44)
+        tex = DDSx("rgba.ddsx", size=44, header=header)
+        raw = bytes((1, 2, 3, 255)) + bytes((4, 5, 6, 255)) * 2 + bytes((10, 20, 30, 255)) * 8
+        with patch.object(tex, "getData", return_value=raw):
+            dds = tex.getDDS()
+        img = Image.open(BytesIO(dds)).convert("RGBA")
+        self.assertEqual(img.size, (4, 2))
+        self.assertEqual(img.getpixel((3, 1)), (10, 20, 30, 255))
+
+        # ATI2 (BC5: 16 bytes per 4x4 block)
+        header = SimpleNamespace(w=8, h=4, d3dformat=b"ATI2", flags=0x40000,
+                                 cMethod=0, levels=2, memSz=48, packedSz=48)
+        tex = DDSx("normal.ddsx", size=48, header=header)
+        raw = b"\x11" * 16 + b"\x22" * 32
+        with patch.object(tex, "getData", return_value=raw):
+            dds = tex.getDDS()
+        self.assertEqual(dds[128:128 + 32], b"\x22" * 32)
+        self.assertEqual(dds[-16:], b"\x11" * 16)
+
     def test_heat_conversion_uses_rg_not_noise_and_blur_channels(self):
         from PIL import Image
         from util.glide import jetHeatNormal
@@ -78,6 +118,15 @@ class VMTTest(unittest.TestCase):
         self.assertTrue(vmt.startswith('"UnlitGeneric"'))
         self.assertIn("$additive 1", vmt)
         self.assertIn("$translucent 1", vmt)
+
+    def test_tex_path_prefers_highest_resolution_pack(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from parse.material import DDSx
+        low = DDSx("content/base/res/zzz-tq_pack.dxp.bin", "body_c", 64, 0, SimpleNamespace(w=32, h=32, packedSz=64))
+        hq = DDSx("content.hq/hq_tex/res/hq_tex_aircrafts/mig_29.dxp.bin", "body_c", 1024, 0, SimpleNamespace(w=2048, h=2048, packedSz=1024))
+        with patch("parse.material.AssetCacher.getCachedAsset", return_value=[low, hq]):
+            self.assertEqual(TexturePathDict("wt_glide").getTexPath("body_c"), "models/wt_glide/mig_29")
 
     def test_jet_flame_texture_gets_disc_art_for_the_plume(self):
         from io import BytesIO
