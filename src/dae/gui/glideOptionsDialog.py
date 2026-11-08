@@ -1,12 +1,13 @@
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QDialog, QWidget, QComboBox, QDoubleSpinBox, QFormLayout, QDialogButtonBox
+from PyQt5.QtWidgets import QDialog, QWidget, QComboBox, QDoubleSpinBox, QFormLayout, QDialogButtonBox, QPushButton, QScrollArea
 from util.i18n import tr
+from util.wtloadout import presetLabel
 
 
 class GlideOptionsDialog(QDialog):
 	"""Lets the user tweak vehicle stats before a Glide export. Values come prefilled from util.glide.defaultOptions."""
 
-	def __init__(self, parent:QWidget, options:dict):
+	def __init__(self, parent:QWidget, options:dict, modelName=None, loadouts=(), slots=(), preview=None, weaponLabels=None):
 		super().__init__(parent)
 
 		self.setWindowTitle(tr("Glide export options"))
@@ -22,6 +23,48 @@ class GlideOptionsDialog(QDialog):
 		initKind = ("heli" if options.get("helicopter") else "plane") if options.get("aircraft") else "ground"
 		self.vehicleType.setCurrentIndex({"ground": 0, "plane": 1, "heli": 2}[initKind])
 		self.form.addRow(tr("Vehicle type"), self.vehicleType)
+
+		self.loadout = QComboBox()
+		self.loadout.addItem(tr("No external weapons"), "")
+		for name, presetPath in loadouts:
+			self.loadout.addItem(name, presetPath)
+		self.form.addRow(tr("Weapon loadout (export-time)"), self.loadout)
+		self.slotCombos = {}
+		self.slotPanel = QScrollArea()
+		self.slotPanel.setWidgetResizable(True)
+		self.slotPanel.setMaximumHeight(240)
+		self.slotPanel.setToolTip(tr("Native choices per slot; cross-slot restrictions and payload limits are not checked."))
+		slotWidget = QWidget()
+		slotForm = QFormLayout(slotWidget)
+		for index, choices in slots:
+			combo = QComboBox()
+			combo.addItem(tr("Empty hardpoint"), "")
+			for name, preset in choices:
+				label, tooltip = presetLabel(preset, weaponLabels or {})
+				combo.addItem(label or name, name)
+				combo.setItemData(combo.count() - 1, tooltip, Qt.ToolTipRole)
+			slotForm.addRow(tr("Hardpoint {slot}", slot=index), combo)
+			self.slotCombos[index] = combo
+		self.slotPanel.setWidget(slotWidget)
+		if self.slotCombos:
+			self.loadout.addItem(tr("Custom hardpoints"), "__custom__")
+		self.form.addRow(self.slotPanel)
+		self.reloadSpins = {}
+		for key, label in (("gun", "Gun reload time"), ("missile", "Missile reload time"), ("bomb", "Bomb reload time")):
+			spin = QDoubleSpinBox()
+			spin.setRange(0, 3600)
+			spin.setDecimals(1)
+			spin.setSpecialValueText(tr("WT default"))
+			spin.setSuffix(" s")
+			self.reloadSpins[key] = spin
+			self.form.addRow(tr(label), spin)
+		self.previewButton = QPushButton(tr("Preview selected loadout"))
+		self.previewButton.setEnabled(preview is not None)
+		self.previewButton.setToolTip(tr("Geometry preview only; Source shaders and animations are not simulated."))
+		if preview is not None:
+			self.previewButton.clicked.connect(lambda: preview(self.options()))
+		self.form.addRow(self.previewButton)
+		self.loadout.currentIndexChanged.connect(self._updateRows)
 
 		self.transmission = QComboBox()
 		self.transmission.addItem(tr("Single differential (pivot on one track)"), True)
@@ -53,6 +96,10 @@ class GlideOptionsDialog(QDialog):
 			self.form.addRow(label, spin)
 			self.spins[key] = spin
 
+		from gui.skinImportWidget import SkinImportWidget
+		self.skins = SkinImportWidget(self, modelName)
+		self.form.addRow(tr("MDL skins"), self.skins)
+
 		buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
 		buttons.accepted.connect(self.accept)
 		buttons.rejected.connect(self.reject)
@@ -73,6 +120,11 @@ class GlideOptionsDialog(QDialog):
 		plane = kind == "plane"
 		self._setRowVisible(self.transmission, ground and not self.wheeled)
 		self._setRowVisible(self.armor, ground)
+		self._setRowVisible(self.loadout, not ground)
+		self.slotPanel.setVisible(not ground and self.loadout.currentData() == "__custom__")
+		self.previewButton.setVisible(not ground)
+		for spin in self.reloadSpins.values():
+			self._setRowVisible(spin, not ground)
 		self._setRowVisible(self.spins["maxFwdSpeed"], ground)
 		self._setRowVisible(self.spins["maxRevSpeed"], ground)
 		self._setRowVisible(self.spins["maxSpeed"], plane)
@@ -83,13 +135,17 @@ class GlideOptionsDialog(QDialog):
 		kind = self.vehicleType.currentData()
 		if kind != "ground":
 			return {
+				"skins": self.skins.paths(),
 				"aircraft": True,
+				"loadout": {index: combo.currentData() for index, combo in self.slotCombos.items()} if self.loadout.currentData() == "__custom__" else self.loadout.currentData(),
+				"reloadTimes": {key: spin.value() for key, spin in self.reloadSpins.items() if spin.value() > 0},
 				"helicopter": kind == "heli",
 				"mass": self.spins["mass"].value(),
 				"maxSpeed": self.spins["maxSpeed"].value(),
 				"engineForce": self.spins["engineForce"].value(),
 			}
 		return {
+			"skins": self.skins.paths(),
 			"aircraft": False,
 			"helicopter": False,
 			"singleFlow": self.transmission.currentData(),

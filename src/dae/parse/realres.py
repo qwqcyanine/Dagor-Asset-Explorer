@@ -169,6 +169,7 @@ class SkinnedMesh(Terminable):
 
 		self.skinNodes = tuple(readInt(file) for _ in SafeRange(self, lod.skinCnt))
 		self.boneOrgTms = [] # per mesh: inverse bind matrix of each bone its vertices index
+		self.boneNodeIds = []
 		self.sizes = tuple(readLong(file) & 0xBFFFFFFF for _ in SafeRange(self, lod.skinCnt))
 		self.mesh = tuple(self.computeMesh(file.readBlock(v), lod, k) for k, v in SafeEnumerate(self, self.sizes))
 			
@@ -215,6 +216,7 @@ class SkinnedMesh(Terminable):
 		) for _ in SafeRange(self, boneOrgTmCnt))
 
 		self.boneOrgTms.append(boneOrgTm)
+		self.boneNodeIds.append(boneNodeIds)
 
 		log.subLevel()
 
@@ -838,6 +840,9 @@ class Model(Terminable):
 	def getUV(self, id:int) -> tuple[float, float, float]:
 		return self.__uvs[id]
 	
+	def setVertex(self, id:int, vertex):
+		self.__vertices[id] = tuple(vertex)
+
 	def getVertex(self, id:int, scale:bool = False, parentBone = None) -> tuple[float, float, float]:
 		v = self.__vertices[id]
 
@@ -2303,14 +2308,23 @@ class DynModel(RendInst):
 
 		nodes = self.geomNodeTree.getNodes()
 
-		for obj, orgTms in zip(mdl, skinnedMesh.boneOrgTms):
-			bones = [bindNode(nodes, tm) for tm in orgTms]
+		for obj, orgTms, nodeIds in zip(mdl, skinnedMesh.boneOrgTms, skinnedMesh.boneNodeIds):
+			# Coincident control bones cannot be disambiguated by bind position.
+			bones = [self.geomNodeTree.getNodeByName(self.__nodeNames[self.__skinNodes[nodeId]])
+				if nodeId in self.__skinNodes else bindNode(nodes, tm)
+				for nodeId, tm in zip(nodeIds, orgTms)]
 
+			# Skin vertices use inverse-bind rest, which can differ from the rigid skeleton's initial pose.
+			transforms = [matrixMul(bone.wtm, tuple(tuple(tm[j][i] for j in range(4)) for i in range(3)) + ((0, 0, 0, 1),))
+				if bone is not None else None for bone, tm in zip(bones, orgTms)]
 			for f in obj.faces:
 				for v in f:
 					links = rawSkin.get(v)
 
-					if links and v not in mdl.skin and all(b < len(bones) and bones[b] is not None for b, _ in links):
+					if links and v not in mdl.skin and all(0 <= b < len(bones) and bones[b] is not None for b, _ in links):
+						vertex = mdl.getVertex(v)
+						posed = [(vectorTransform(transforms[b], vertex), w) for b, w in links]
+						mdl.setVertex(v, (sum(p[i] * w for p, w in posed) for i in range(3)))
 						mdl.skin[v] = tuple((bones[b].idx, w) for b, w in links)
 
 	def getModel(self, lodId:int):

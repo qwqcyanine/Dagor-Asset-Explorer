@@ -126,6 +126,30 @@ class GlideTest(unittest.TestCase):
         self.assertIs(bindNode(nodes, (*rows, t)), bone) # the coincident child loses to its parent
         self.assertIs(bindNode(nodes, ((1, 0, 0), (0, 1, 0), (0, 0, 1), (0, 0, 0))), nodes[0])
 
+    def test_skin_uses_native_ids_for_coincident_control_bones(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace as NS
+        from parse.realres import DynModel
+        identity = ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))
+        rotated = ((0, -1, 0, 0), (1, 0, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))
+        fixed, moving = NS(idx=46, name='casing', wtm=identity), NS(idx=349, name='stick_ailerons', wtm=rotated)
+        skeleton = NS(getNodes=lambda: [fixed, moving],
+                      getNodeByName=lambda name: {'casing': fixed, 'stick_ailerons': moving}.get(name))
+        dyn = NS(geomNodeTree=skeleton, _DynModel__skinNodes={57: 0, 59: 1},
+                 _DynModel__nodeNames=['casing', 'stick_ailerons'])
+        model = Model('skin')
+        model.newObject('skin', skinned=True).faces = [(0, 1, 2)]
+        model.appendVerts([(1, 0, 0)] * 3, [(0, 0)] * 3, scale=False)
+        inverse_bind = ((1, 0, 0), (0, 1, 0), (0, 0, 1), (0, 0, 0))
+        mesh = NS(boneOrgTms=[[inverse_bind, inverse_bind]], boneNodeIds=[[59, 57]])
+        vertex_data = [(NS(getSkin=lambda: [((0, .75), (1, .25))] * 3), 0)]
+        with patch('parse.realres.bindNode', side_effect=AssertionError('Must use native IDs')):
+            DynModel._DynModel__applySkin(dyn, model, mesh, vertex_data)
+        self.assertEqual(model.skin[0], ((349, .75), (46, .25)))
+        self.assertEqual(len(model.skin), 3)
+        for index in range(3):
+            self.assertEqual(model.getVertex(index), (.25, .75, 0))
+
     def test_smd_writes_vertex_weights(self):
         smd = SMD("x", "x")
         tri = smd.newTriangle("m", ((0, 0, 0),) * 3, ((0, 0),) * 3)
@@ -138,6 +162,22 @@ class GlideTest(unittest.TestCase):
 
 
 class WTSoundTest(unittest.TestCase):
+    def test_steady_engine_excludes_ignition_but_keeps_nested_loops(self):
+        import numpy as np
+        from types import SimpleNamespace as NS
+        from util.wtsound import Renderer
+        loop = NS(kind='WAIB', loop=-1, pitch=0, autoPitchParam=None)
+        shot = NS(kind='WAIB', loop=0, pitch=0, autoPitchParam=None)
+        nested = NS(kind='EVIB', loop=0, event='child')
+        bank = NS(instruments={'loop': loop, 'shot': shot, 'nested': nested},
+                  pcm=lambda i: np.ones(32, np.float32), events={'child': object()})
+        renderer = Renderer(bank, steadyLoops=True)
+        self.assertEqual(len(renderer.instrument('shot')), 0)
+        self.assertEqual(len(renderer.instrument('loop')), 32)
+        renderer.event = lambda *args: np.ones(17)
+        self.assertEqual(len(renderer.instrument('nested')), 17)
+        self.assertEqual(len(Renderer(bank).instrument('shot')), 32)
+
     def test_sound_events_and_reload(self):
         from util.glide import soundEvents, cannonReload, firstWeapon
         blk = {
@@ -206,6 +246,34 @@ class WTSoundTest(unittest.TestCase):
         self.assertAlmostEqual(r.autoPitch(i, 0), 0.9)
         self.assertAlmostEqual(r.autoPitch(i, 80), 1.0)
         self.assertAlmostEqual(r.autoPitch(i, 40), 0.95)
+
+    def test_engine_rpm_variants_keep_layers_and_drive_gain_and_pitch(self):
+        from types import SimpleNamespace
+        from util.wtsound import engineLayers, Instrument, Event
+        instrument, event = Instrument(), Event()
+        instrument.kind, instrument.wave = "WAIB", b"wave"
+        instrument.conditions = [(b"rpm", 20, 90)]
+        instrument.autoPitchParam, instrument.autoPitchRef, instrument.autoPitchMin = b"rpm", 80, 0.5
+        event.layouts = [b"layout"]
+        bank = SimpleNamespace(events={b"event": event}, layouts={b"layout": (b"rpm", [b"loop"])},
+            instruments={b"loop": instrument}, waves={b"wave": b"sample"},
+            controllers={b"loop": [(b"ctrl", b"curve", 4)]}, controllerParam={b"ctrl": b"rpm"},
+            curves={b"curve": [(0, 0), (100, 1)]}, busEffects={}, faders={})
+        expected = None
+        for name in ("rpm_result", "rpm_result_2c25", "rpm_result_t80", "rpm"):
+            with self.subTest(name=name):
+                bank.params = {b"rpm": (name, 0, 100, 0)}
+                layers = engineLayers(bank, b"event")
+                self.assertEqual(len(layers), 1) # default RPM=0 must not discard a running layer
+                controls = layers[0][1]
+                self.assertIn(("rpmFraction", 0, 1, "pitch", 0.5, 1.125), controls)
+                self.assertIn(("rpmFraction", 0, 1, "volume", 1e-4, 1.0), controls)
+                if expected is None:
+                    expected = layers
+                self.assertEqual(layers, expected)
+        for name in ("Distance", "rpm_resultant"):
+            bank.params = {b"rpm": (name, 0, 100, 0)}
+            self.assertEqual(engineLayers(bank, b"event"), []) # unrelated parameters still use defaults
 
     def test_bus_gain_automation_replaces_static_and_adds_faders(self):
         from util.wtsound import Renderer, db
@@ -291,9 +359,9 @@ class AircraftTest(unittest.TestCase):
         from util.glide import generateAircraftLua, aircraftGuns
         node = SimpleNamespace(name="flare1", wtm=[[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
         skeleton = SimpleNamespace(getNodes=lambda: [node], getNodeByName=lambda name: node if name == "flare1" else None)
-        weapons = [{"trigger": "cannon", "emitter": "flare1", "blk": ref,
+        weapons = [{"trigger": "cannon", "emitter": "flare1", "blk": ref, "bullets": 150, "arcadeReload": 60,
                     "weaponBlk": {"shotFreq": 30, "bullet": {"caliber": 0.03}}} for ref in ("a.blk", "b.blk")]
-        blk = {"fm": {}, "builtinPreset": {"Weapon": weapons},
+        blk = {"fm": {}, "exhaustTexture": "models/test/exhaust", "builtinPreset": {"Weapon": weapons},
                "AfterBurner0": {"volumetricAfterBurner": {"name": "native", "maxHeight": 10, "maxRadius": 0.3}}}
         # builtinPreset is populated by findAircraftBlk.
         from unittest.mock import patch
@@ -302,9 +370,13 @@ class AircraftTest(unittest.TestCase):
             lua = generateAircraftLua("wt_test", "test", "test.mdl", skeleton, blk,
                 sounds={"guns": {"a.blk": ["gun0_0", "gun0_1"]}, "engine": {"idle": "idle", "full": "full", "wep": "wep"},
                         "gear": {"start": "gear_start", "loop": "gear_loop", "end": "gear_end"}})
+        self.assertIn('ENT.WTHideCrew = false', lua)
         self.assertIn('"maxHeight":10', lua)
-        self.assertIn('mesh.Begin( result, MATERIAL_TRIANGLES', lua)
-        self.assertIn('volumeMesh:Draw()', lua)
+        self.assertNotIn('mesh.Begin( result, MATERIAL_TRIANGLES', lua)
+        self.assertNotIn('volumeMesh:Draw()', lua)
+        self.assertIn('include( "wt_jet_exhaust/volume.lua" )', lua)
+        self.assertIn('AddCSLuaFile( "wt_jet_exhaust/exhaust.lua" )', lua)
+        self.assertIn('drawWTVolume( origin, angles, flame )', lua)
         self.assertNotIn('PLUME_V0', lua)
         self.assertIn('FireDelay = 0.03333', lua)
         self.assertIn('SingleShotSound = "wt_test.Gun0"', lua)
@@ -312,10 +384,11 @@ class AircraftTest(unittest.TestCase):
         self.assertEqual(lua.count('SingleShotSound = '), 1)
         self.assertIn('wt/wt_test/gun0_1.wav', lua)
         self.assertIn('self:CreateLoopingSound( "wt_idle"', lua)
+        self.assertIn('90 ):PlayEx( 0, 100 )', lua)
         self.assertIn('wt/wt_test/gear_loop.wav', lua)
         self.assertIn('elseif self.wtGearMoving then', lua) # no lock sound on initial spawn
         self.assertIn('ent.wtGearMotor:Stop()', lua)
-        self.assertIn('local opacity = 1 - math.exp(', lua)
+        self.assertNotIn('local opacity = 1 - math.exp(', lua)
         self.assertIn('VOLUME.preNominalEasingParams', lua)
 
     def test_aircraft_sound_uses_gun_event_not_generic_layer(self):
@@ -355,9 +428,10 @@ class AircraftTest(unittest.TestCase):
             "engines": {"outside": {"path": "aircraft/engines", "eventFront": "", "eventBack_1": "turbine"}},
             "propellers": {"outside": {"path": "aircraft/engines", "event_1": "rotor", "event_2": "tail"}}}}
         refs = {"event:/aircraft/engines/" + n: n for n in ("turbine", "rotor", "tail")}
-        bank = SimpleNamespace(events={n: SimpleNamespace(layouts=["rpm", "rpm2"]) for n in refs.values()},
-            layouts={n: (n, []) for n in ("rpm", "rpm2")},
-            params={"rpm": ("rpm", 30, 2200, 30), "rpm2": ("rpm2", 0, 2700, 0)},
+        bank = SimpleNamespace(events={n: SimpleNamespace(layouts=["rpm", "rpm2", "variant"]) for n in refs.values()},
+            layouts={n: (n, []) for n in ("rpm", "rpm2", "variant")},
+            params={"rpm": ("rpm", 30, 2200, 30), "rpm2": ("rpm2", 0, 2700, 0),
+                    "variant": ("rpm_result_custom", 0, 100, 0)},
             walk=lambda g: [], decode=lambda gs: None)
         blk = {"Sound": {"Engine": "native_heli"}, "helicopter": {}, "fm": {}}
         with tempfile.TemporaryDirectory() as temp, patch("util.glide.path.isfile", return_value=True), \
@@ -370,6 +444,7 @@ class AircraftTest(unittest.TestCase):
             self.assertNotIn("engine", sounds)
             params = render.call_args.args[1]
             self.assertEqual((params["rpm"], params["rpm2"], params["broken"]), (2200, 2700, 0))
+            self.assertEqual(params["rpm_result_custom"], 100)
             self.assertIn(b"cue ", Path(temp, "heli_0.wav").read_bytes())
             source = json.loads(Path(temp, "sources.json").read_text())["helicopter"]
             self.assertEqual(source[2]["event"], "event:/aircraft/engines/tail")
@@ -439,16 +514,41 @@ class AircraftTest(unittest.TestCase):
         from util.glide import generateAircraftLua
         node = SimpleNamespace(name="root", wtm=[[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
         skeleton = SimpleNamespace(getNodes=lambda: [node], getNodeByName=lambda name: None)
-        for texture in ("", "models/wt_glide/fx/distortion_hot_air_a_normal"):
-            lua = generateAircraftLua("wt_test", "test", "models/test.mdl", skeleton, {"fm": {}}, heatTexture=texture)
-            self.assertIn("local HEAT = " + str(bool(texture)).lower() + " and CreateMaterial", lua)
+        for texture in ("", "models/wt_glide/wt_test/exhaust"):
+            lua = generateAircraftLua("wt_test", "test", "models/test.mdl", skeleton, {"fm": {}, "exhaustTexture": texture})
             self.assertNotIn("dev/water_normal", lua)
-            self.assertIn('if HEAT then', lua)
-            self.assertIn('EyeAngles():Right() * size', lua)
-            self.assertIn('mesh.Normal( normal ) mesh.UserData(', lua)
-            self.assertNotIn('heatScroll', lua)
+            self.assertNotIn('BuildVolume', lua)
+            self.assertNotIn('volumeMesh', lua)
             if texture:
-                self.assertIn('["$normalmap"] = "' + texture + '"', lua)
+                self.assertIn('exhaust.Heat(', lua)
+                self.assertIn('AddCSLuaFile( "wt_jet_exhaust/volume.lua" )', lua)
+                self.assertIn('drawWTVolume( origin, angles, flame )', lua)
+            else:
+                self.assertNotIn('include( "wt_jet_exhaust/', lua)
+
+    def test_flaperons_keep_nested_bones_but_drive_only_parent_hinges(self):
+        import numpy as np
+        from types import SimpleNamespace
+        from util.glide import AIRCRAFT_BONE_RE, controlSurfaces
+        root = SimpleNamespace(name='root', parent=None, wtm=np.eye(4))
+        nodes = {}
+        # Local Y hinge runs spanwise, not vertically in aircraft coordinates.
+        hinge = np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]])
+        for side in ('l', 'r'):
+            parent = SimpleNamespace(name='flaperon_' + side, parent=root, wtm=hinge)
+            child = SimpleNamespace(name='flaperon1_' + side, parent=parent, wtm=hinge)
+            nodes.update({n.name: n for n in (parent, child)})
+        class Model(list):
+            skeleton = SimpleNamespace(getNodeByName=nodes.get)
+            def getVertex(self, index, *args):
+                return [(-2, 0, 0), (-1, 0, 1), (-1, 0, -1)][index]
+        model = Model(SimpleNamespace(name=name, skinned=False, faces=[(0, 1, 2)]) for name in nodes)
+        self.assertTrue(all(AIRCRAFT_BONE_RE.fullmatch(name) for name in nodes))
+        controls = controlSurfaces(model)
+        self.assertEqual([c[0] for c in controls], ['flaperon_l', 'flaperon_r'])
+        self.assertTrue(all(c[1] == 'GetAileron' for c in controls))
+        self.assertEqual(controls[0][3], -controls[1][3])
+        self.assertEqual(abs(controls[0][3]), 20)
 
     def test_gear_sequences_preserve_neutral_ailerons(self):
         import numpy as np
@@ -514,9 +614,12 @@ class AircraftTest(unittest.TestCase):
     def test_hidden_and_collision_nodes(self):
         from util.glide import aircraftCollisionNodes, aircraftHiddenNodes
         blk = {"WeaponSlots": {"HideNodes": {"node": ["pylon1", "fuse4"]}, "WeaponSlot": [{"index": 0, "WeaponPreset": [{"ShowNodes": {"node": "fuse4"}}]}]}}
-        names = ["fuse", "fuse4", "pylon1", "flare3", "prop01_1", "prop02_1", "prop01_1_dmg", "jet_flame"]
+        names = ["fuse", "fuse4", "pylon1", "flare3", "prop01_1", "prop02_1", "prop01_1_dmg", "jet_flame", "chute1", "chute2", "chute3"]
         self.assertEqual(aircraftHiddenNodes(names, blk), {"pylon1", "flare3", "prop02_1", "prop01_1_dmg"}) # jet_flame stays, scaled with thrust
         self.assertEqual(aircraftCollisionNodes(["fuse_dm", "wing1_l_dm", "tank3_dm", "gear_l_dm", "wingcontrol_dm"]), {"fuse_dm", "wing1_l_dm"})
+        from util.wtloadout import hiddenNodes
+        self.assertFalse(hiddenNodes({}, [], ["chute1", "chute2", "chute3"]))
+        self.assertEqual(hiddenNodes({"WeaponSlots": {"HideNodes": {"node": "chute1"}}}, [], ["chute1"]), {"chute1"})
 
     def test_remove_objects_prunes_unused_materials(self):
         from types import SimpleNamespace
@@ -533,6 +636,7 @@ class AircraftTest(unittest.TestCase):
         from unittest.mock import patch
         from util.glide import findAircraftBlk, defaultOptions
         files = {
+            "config/gameplay.blk": {},
             "gamedata/flightmodels/bf-109a_1.blk": {"model": "bf_109a_1"},
             "gamedata/flightmodels/fm/bf-109a_1.blk": {"Mass": {"EmptyMass": 1900.0, "MaxFuelMass0": 177.0}},
             "gamedata/flightmodels/ef_2000a.blk": {"model": "f_2000a", "fmFile": "fm/f_2000a.blk"},

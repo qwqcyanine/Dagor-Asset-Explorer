@@ -472,10 +472,11 @@ STREAM_INPUTS = {"rpm_result": "rpmFraction", "rpm": "rpmFraction", "speed": "rp
 
 class Renderer:
 	"""Evaluates War Thunder FMOD events at fixed parameter values. Parameters not given use their default (distance 0)."""
-	def __init__(self, bank:SoundBank, params:dict = None, seed:int = 0):
+	def __init__(self, bank:SoundBank, params:dict = None, seed:int = 0, steadyLoops:bool = False):
 		self.bank = bank
 		self.params = params or {}
 		self.rng = np.random.default_rng(seed)
+		self.steadyLoops = steadyLoops
 
 	def value(self, guid):
 		name, lo, hi, default = self.bank.params.get(guid, ("", 0, 0, 0))
@@ -531,7 +532,7 @@ class Renderer:
 		"""Mono audio of one instrument; `length` (s) tiles loops / fills scatterers."""
 		i = self.bank.instruments.get(guid)
 
-		if i is None:
+		if i is None or (self.steadyLoops and i.kind != "EVIB" and i.loop >= 0):
 			return np.zeros(0, np.float32)
 
 		if i.kind == "WAIB":
@@ -669,7 +670,8 @@ def engineLayers(bank:SoundBank, eventGuid:bytes):
 
 	def mapped(param):
 		name, lo, hi, _ = bank.params.get(param, ("", 0, 1, 0))
-		return (STREAM_INPUTS[name], lo, hi) if name in STREAM_INPUTS else None
+		inp = "rpmFraction" if name.startswith("rpm_result_") else STREAM_INPUTS.get(name)
+		return (inp, lo, hi) if inp else None
 
 	for l in e.layouts:
 		for g in bank.layouts.get(l, (None, ()))[1]:

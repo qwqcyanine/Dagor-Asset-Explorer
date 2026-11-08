@@ -92,6 +92,46 @@ class DDSxTest(unittest.TestCase):
 
 
 class VMTTest(unittest.TestCase):
+    def test_masked_cutout_preserves_coverage_not_inverted_paint_mask(self):
+        from io import BytesIO
+        from PIL import Image
+        from util.enums import TEXTURE_GENERIC, TEXTURE_MASKED
+
+        src = Image.new('RGBA', (4, 1))
+        src.putdata([(100, 110, 120, a) for a in (0, 64, 192, 255)])
+        buf = BytesIO()
+        src.save(buf, format='DDS')
+        for cls, param, cutout in (
+            ('dynamic_masked_chrome_bump', 'atest=127', True),
+            ('dynamic_masked_chrome_bump_atest', '', True),
+            ('dynamic_masked_chrome_bump', '', False),
+            ('dynamic_masked_chrome_bump', 'atest=128', False),
+        ):
+            with self.subTest(cls=cls,param=param):
+                mat = material(cls, {0:'pod_a*'}, param)
+                paths = TexturePathDict('wt')
+                vmt = mat.getVMT(paths)
+                key = 'pod_a' if cutout else 'pod_am'
+                self.assertEqual(paths.get(key).texType, TEXTURE_GENERIC if cutout else TEXTURE_MASKED)
+                out, _ = mat.convertTex('pod_a', buf.getvalue(), paths, texN=key)
+                alpha = list(Image.open(BytesIO(out)).convert('RGBA').getchannel('A').getdata())
+                self.assertEqual(alpha, [0,64,192,255] if cutout else [255,191,63,0])
+                if cutout:
+                    self.assertIn('$alphatest 1', vmt)
+                    self.assertIn('$alphatestreference', vmt)
+                else:
+                    self.assertNotIn('$alphatest', vmt)
+
+    def test_alpha_blend_preserves_texture_coverage(self):
+        from util.enums import TEXTURE_GENERIC
+
+        paths = TexturePathDict('wt')
+        vmt = material('dynamic_alpha_blend', {0: 'glass_dirt*'}).getVMT(paths)
+        self.assertIn('$translucent 1', vmt)
+        self.assertNotIn('$alphatest', vmt)
+        self.assertNotIn('$envmap', vmt)
+        self.assertEqual(paths.get('glass_dirt').texType, TEXTURE_GENERIC)
+
     def test_detail_normal_and_cubemap_are_not_details(self):
         for detailSlot, tex in ((4, "aircraft_normal_detail_n*"), (1, "stalingrad_noon_cubemap_blur*")):
             vmt = material("dynamic_masked_chrome_bump", {0: "skin_c*", 2: "skin_n*", detailSlot: tex}).getVMT(TexturePathDict("x"))
@@ -109,15 +149,42 @@ class VMTTest(unittest.TestCase):
         self.assertIn("$wtopacity 0.9", vmt)
         self.assertIn('resultVar "$alpha"', vmt)
 
+    def test_textured_glass_keeps_explicit_opacity(self):
+        vmt = material('dynamic_masked_glass_chrome', {0: 'empty_glass*'}, 'opacity=0.1').getVMT(TexturePathDict('wt'))
+        self.assertIn('$wtopacity 0.1', vmt)
+        self.assertIn('resultVar "$alpha"', vmt)
+        self.assertNotIn('$color2', vmt)
+
     def test_glass_variants_get_their_own_vmt(self):
         names = {material("dynamic_glass_chrome", {}, f"opacity={o}").getName() for o in ("0.17", "0.9")}
         self.assertEqual(len(names), 2)
+
+    def test_coating_only_canopy_has_a_material_name(self):
+        from parse.material import computeMaterialNames
+
+        mats = [material("dynamic_glass_chrome", {3: "rainbow_light_coating*"}, f"opacity={o}")
+                for o in ("0.17", "0.5")]
+        computeMaterialNames(mats)
+        self.assertEqual([m.getName() for m in mats],
+                         ["rainbow_light_coating_017", "rainbow_light_coating_05"])
+        vmt = mats[0].getVMT(TexturePathDict("x"))
+        self.assertIn("$wtopacity 0.17", vmt)
+        self.assertIn("$translucent 1", vmt)
+        self.assertNotIn("$basetexture", vmt)
 
     def test_jet_flame_is_additive(self):
         vmt = material("aces_weapon_fire", {0: "jet_flame_diamonds*"}).getVMT(TexturePathDict("x"))
         self.assertTrue(vmt.startswith('"UnlitGeneric"'))
         self.assertIn("$additive 1", vmt)
         self.assertIn("$translucent 1", vmt)
+
+    def test_static_muzzle_flash_is_not_drawn_as_permanent_fire(self):
+        mat = material("aces_weapon_fire", {0: "gunfire*"})
+        vmt = mat.getVMT(TexturePathDict("models/wt"))
+        self.assertIn('$additive 1', vmt)
+        self.assertIn("$no_draw 1", vmt)
+        jet = material("aces_weapon_fire", {0: "jet_flame_diamonds*"})
+        self.assertNotIn("$no_draw 1", jet.getVMT(TexturePathDict("models/wt")))
 
     def test_tex_path_prefers_highest_resolution_pack(self):
         from types import SimpleNamespace

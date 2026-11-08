@@ -685,6 +685,14 @@ class MaterialData(Terminable):
 			if detail is None and i + 1 < len(self.__textureSlots):
 				addComp(components, self.__textureSlots[i + 1])
 
+		# Coating-only glass uses t3, which the diffuse/detail naming above skips.
+		if not components:
+			for texture in self.textures:
+				addComp(components, texture)
+			opacity = self.getParams().get("opacity")
+			if opacity is not None:
+				components.append(opacity.replace('.', ''))
+
 		return "_".join(components)
 
 	def checkModifiedName(self, tex:str, texturePaths:TexturePathDict):
@@ -925,6 +933,7 @@ class MaterialData(Terminable):
 	def getVMT(self, texturePaths:TexturePathDict):
 		params = self.getParams()
 		getScale = lambda x: 1 / float(params.get(x)) if x in params else 1
+		alphaTest = ("atest" in params and params["atest"] != "128") or "atest" in self.cls
 
 		vmt = self.getVMTcomments()
 		shader = "VertexLitGeneric"
@@ -932,7 +941,8 @@ class MaterialData(Terminable):
 		if self.diffuse is not None:
 			texType = TEXTURE_GENERIC
 			
-			if self.cls.find("masked") != -1:
+			if self.cls.find("masked") != -1 and not alphaTest:
+				# Cutout alpha is coverage, not the inverted paint mask used by opaque materials.
 				texType = TEXTURE_MASKED
 			elif self.cls.find("glass") != -1:
 				texType = TEXTURE_GLASS
@@ -992,9 +1002,13 @@ class MaterialData(Terminable):
 
 			if diffuse is None: # untextured canopy glass: light tint at War Thunder's opacity
 				vmt.append('$color2 "[0.75 0.8 0.85]"')
+			if diffuse is None or 'opacity' in params:
 				# studio models overwrite $alpha with the entity alpha every draw, a proxy sets it back afterwards
 				vmt.append(f"$wtopacity {params.get('opacity', '0.3')}")
 				vmt.append('Proxies\n\t{\n\t\tEquals\n\t\t{\n\t\t\tsrcVar1 "$wtopacity"\n\t\t\tresultVar "$alpha"\n\t\t}\n\t}')
+		elif self.cls == "dynamic_alpha_blend":
+			# Cockpit glass dirt uses texture coverage, not opaque paint or glass remapping.
+			vmt.append("$translucent 1")
 		elif self.cls == "aces_weapon_fire": # muzzle flashes and jet flames glow
 			vmt.append("$additive 1")
 			vmt.append("$nocull 1")
@@ -1004,8 +1018,12 @@ class MaterialData(Terminable):
 				vmt.append("$translucent 1")
 				vmt.append("$vertexalpha 1") # Lua fades the nozzle glow by thrust
 				vmt.append("$vertexcolor 1")
-		elif ("atest" in params and params["atest"] != "128") or self.cls.find("atest") != -1:
+			else:
+				# WT gates muzzle cards by firing state; Source effects supply the flash instead.
+				vmt.append("$no_draw 1")
+		elif alphaTest:
 			vmt.append("$alphatest 1")
+			vmt.append(f"$alphatestreference {float(params.get('atest', '128')) / 255:.6f}")
 			vmt.append("$nocull 1")
 		elif "two_sided" in params:
 			vmt.append("$nocull 1")

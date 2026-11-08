@@ -9,13 +9,14 @@ import numpy as np
 import util.log as log
 from OpenGL import GL
 from PIL import Image
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QPointF, QRectF
+from PyQt5.QtGui import QPainter, QColor, QPen
 from PyQt5.QtWidgets import QDialog, QOpenGLWidget
 from PyQt5.uic import loadUi
 from parse.material import DDSx, MaterialData, getBestTex
 from parse.realres import Model
 from util.assetcacher import AssetCacher
-from util.i18n import translateUi
+from util.i18n import translateUi, tr
 from util.misc import getUIPath
 
 PREVIEWUI_PATH = getUIPath("preview.ui")
@@ -105,6 +106,16 @@ def buildMeshParts(model:Model, loadTextures:bool = True):
 	return parts
 
 
+def projectMarker(position, modelview, projection, width, height):
+	clip = projection @ modelview @ np.array((*position, 1.0))
+	if clip[3] <= 0:
+		return None
+	x, y, z = clip[:3] / clip[3]
+	if not -1 <= z <= 1:
+		return None
+	return ((x + 1) * width / 2, (1 - y) * height / 2)
+
+
 class CustomOpenGL(QOpenGLWidget):
 	def __init__(self, parent = None):
 		super().__init__(parent)
@@ -117,6 +128,7 @@ class CustomOpenGL(QOpenGLWidget):
 		self.pitch = 20.0
 		self.distance = 3.0
 		self.lastPos = None
+		self.markers = []
 
 	def setParts(self, parts:list[MeshPart]):
 		self.parts = parts
@@ -154,9 +166,14 @@ class CustomOpenGL(QOpenGLWidget):
 			GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR_MIPMAP_LINEAR)
 			GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
 			GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_GENERATE_MIPMAP, GL.GL_TRUE)
-			GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
-			w, h = part.image.size
-			GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB, w, h, 0, GL.GL_RGB, GL.GL_UNSIGNED_BYTE, part.image.tobytes())
+			alignment = GL.glGetIntegerv(GL.GL_UNPACK_ALIGNMENT)
+			try:
+				GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+				w, h = part.image.size
+				GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB, w, h, 0, GL.GL_RGB, GL.GL_UNSIGNED_BYTE, part.image.tobytes())
+			finally:
+				# Qt's glyph atlas uploads require their original row alignment.
+				GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, alignment)
 			self.textures.append(tex)
 
 	def resizeGL(self, w:int, h:int):
@@ -206,6 +223,47 @@ class CustomOpenGL(QOpenGLWidget):
 		GL.glDisableClientState(GL.GL_TEXTURE_COORD_ARRAY)
 		GL.glDisableClientState(GL.GL_NORMAL_ARRAY)
 		GL.glDisableClientState(GL.GL_VERTEX_ARRAY)
+		if self.markers:
+			self.drawMarkers()
+
+	def drawMarkers(self):
+		modelview = np.asarray(GL.glGetDoublev(GL.GL_MODELVIEW_MATRIX)).T
+		projection = np.asarray(GL.glGetDoublev(GL.GL_PROJECTION_MATRIX)).T
+		GL.glPushAttrib(GL.GL_ALL_ATTRIB_BITS)
+		painter = QPainter(self)
+		try:
+			painter.setRenderHint(QPainter.Antialiasing)
+			font = painter.font()
+			font.setBold(True)
+			painter.setFont(font)
+			used = []
+			for index, pos, loaded in self.markers:
+				point = projectMarker(pos, modelview, projection, self.width(), self.height())
+				if point is None:
+					continue
+				x, y = point
+				if not (0 <= x <= self.width() and 0 <= y <= self.height()):
+					continue
+				box = QRectF(x + 8, y - 30, 30, 24)
+				box.moveLeft(min(box.left(), max(0, self.width() - box.width())))
+				box.moveTop(max(28, min(box.top(), self.height() - box.height())))
+				direction = 26 if box.center().y() < self.height() / 2 else -26
+				while any(box.intersects(other) for other in used):
+					box.translate(0, direction)
+				used.append(box)
+				color = QColor('#ffcb58' if loaded else '#9fddff')
+				painter.setPen(QPen(color, 2))
+				painter.drawLine(QPointF(x, y), box.center())
+				painter.setBrush(color)
+				painter.drawEllipse(QPointF(x, y), 3, 3)
+				painter.setBrush(QColor(20, 25, 35, 225))
+				painter.drawRoundedRect(box, 4, 4)
+				painter.drawText(box, Qt.AlignCenter, str(index))
+			painter.setPen(QColor('white'))
+			painter.drawText(10, 20, tr('Hardpoints: yellow = loaded, blue = empty (shown through model)'))
+		finally:
+			painter.end()
+			GL.glPopAttrib()
 
 	def mousePressEvent(self, event):
 		self.lastPos = event.pos()
@@ -229,7 +287,7 @@ class CustomOpenGL(QOpenGLWidget):
 
 
 class PreviewDialog(QDialog):
-	def __init__(self, parent, title:str, parts:list[MeshPart]):
+	def __init__(self, parent, title:str, parts:list[MeshPart], markers=()):
 		super().__init__(parent)
 
 		loadUi(PREVIEWUI_PATH, self)
@@ -238,5 +296,6 @@ class PreviewDialog(QDialog):
 		self.setWindowTitle(title)
 		self.setAttribute(Qt.WA_DeleteOnClose)
 		self.gl:CustomOpenGL
+		self.gl.markers = markers
 		self.gl.setParts(parts)
 

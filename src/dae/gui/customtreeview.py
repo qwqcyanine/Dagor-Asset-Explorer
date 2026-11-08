@@ -594,7 +594,25 @@ class ExportToSource(SaveAction):
 	def taskTitle(self) -> str:
 		return tr("Exporting LOD {lod} to {file}", lod = self.lod, file = f"{self.item.asset.name}.mdl")
 
+	def preRun(self):
+		from PyQt5.QtWidgets import QDialog, QVBoxLayout, QDialogButtonBox
+		from gui.skinImportWidget import SkinImportWidget
+		dialog = QDialog(self.mainWindow)
+		dialog.setWindowTitle(tr("MDL skins"))
+		layout = QVBoxLayout(dialog)
+		skins = SkinImportWidget(dialog, self.item.asset.name)
+		layout.addWidget(skins)
+		buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+		buttons.accepted.connect(dialog.accept)
+		buttons.rejected.connect(dialog.reject)
+		layout.addWidget(buttons)
+		if dialog.exec_() != QDialog.Accepted:
+			return False
+		self.skinArchives = skins.paths()
+		return super().preRun()
+
 	modelPath = "dae_out"
+	skinArchives = ()
 	keepBones = None
 	forcedSettings = {}
 
@@ -603,6 +621,9 @@ class ExportToSource(SaveAction):
 
 	def prepareSourceModel(self, smdl):
 		pass
+
+	def compileTargets(self, qc):
+		return [(qc, self.item.asset.name)]
 
 	def save(self, output:str):
 		modelPath = self.modelPath
@@ -653,6 +674,14 @@ class ExportToSource(SaveAction):
 		
 		self.setTaskStatus(tr("Exporting model data to QC, SMD and VMT"))
 		qc, texturePaths = smdl.export(output, modelPath, exportCollisionModel, exportSMDs)
+		if self.skinArchives:
+			if not exportTex or not exportSMDs:
+				raise ValueError("Skin import requires SMD and texture export")
+			from util.wtskins import importSkins
+			report = importSkins(qc, smdl.model.materials, texturePaths, self.skinArchives, vtfCmd, asset.name)
+			for skin in report:
+				log.log(f"Skin {skin['skin']}: {skin['name']}; unused replacements: {skin['unused']}")
+		compileTargets = self.compileTargets(qc) if exportSMDs else []
 		self.setTaskProgress(2/stepCnt)
 		self.clearTerminable()
 	
@@ -672,20 +701,14 @@ class ExportToSource(SaveAction):
 			
 			self.setTaskStatus(tr("Compiling"))
 
-			pipes = Popen([
-				compiler, 
-				"-nop4", 
-				"-verbose", 
-				"-game", 
-				gamePath, 
-				qc])
-			
-			self.setSubProcess(pipes)
-
-			if pipes.wait() != 0:
-				raise Exception(f"Compile failed: return code {pipes.returncode}")
-			
-			self.clearSubProcess()
+			for compileQC, modelName in compileTargets:
+				if self.shouldTerminate:
+					return
+				pipes = Popen([compiler, "-nop4", "-verbose", "-game", gamePath, str(compileQC)])
+				self.setSubProcess(pipes)
+				if pipes.wait() != 0:
+					raise Exception(f"Compile failed ({modelName}): return code {pipes.returncode}")
+				self.clearSubProcess()
 
 			if not exportToGame:
 				if self.shouldTerminate:
@@ -695,7 +718,7 @@ class ExportToSource(SaveAction):
 
 				makedirs(modelOutPath, exist_ok = True)
 				
-				files = glob(path.join(gamePath, f"models/{modelPath}/{asset.name}.*"))
+				files = [f for _, modelName in compileTargets for f in glob(path.join(gamePath, f"models/{modelPath}/{modelName}.*"))]
 
 				for f in files:
 					if self.shouldTerminate:
@@ -785,6 +808,33 @@ class ExportToSource(SaveAction):
 		return False
 
 class ExportToGlide(ExportToSource):
+	def previewLoadout(self, options):
+		from copy import deepcopy
+		from gui.previewDialog import PreviewDialog, buildMeshParts
+		from PyQt5.QtWidgets import QApplication
+		from util.wtloadout import apply, resolve, hardpointMarkers
+		from util.vromfs import VROMFS
+		QApplication.setOverrideCursor(Qt.WaitCursor)
+		try:
+			# Match the existing preview path; clone before merging to keep cached geometry intact.
+			model = deepcopy(self.item.asset.getModel(self.lod))
+			selected = []
+			if options.get("loadout"):
+				root = findGameRoot(self.item.asset.filePath)
+				selected = resolve(self.blk, options["loadout"], VROMFS(path.join(root, 'aces.vromfs.bin')))
+				apply(model, self.blk, options["loadout"], root, set(), previewOnly=True)
+			else:
+				model.removeObjects(aircraftHiddenNodes([o.name for o in model], self.blk))
+			markers = hardpointMarkers(self.blk or {}, model.skeleton, selected)
+			parts = buildMeshParts(model)
+		except Exception as error:
+			print(format_exc())
+			MessageBox(str(error)).exec_()
+			return
+		finally:
+			QApplication.restoreOverrideCursor()
+		PreviewDialog(self.mainWindow, self.item.asset.name, parts, markers).exec_()
+
 	modelPath = "wt_glide"
 	keepBones = GLIDE_KEEP_BONES
 	forcedSettings = {SETTINGS_EXPORT_GAMEINFO: False, SETTINGS_STUDIOMDL_EXPORT_COLLISION: True, SETTINGS_EXPORT_SMD: True, SETTINGS_NO_MDL: False, SETTINGS_NO_TEX_EXPORT: False}
@@ -807,12 +857,17 @@ class ExportToGlide(ExportToSource):
 			heli = asset.geomNodeTree.getNodeByName("prop01_2") is not None and not any(n.name.startswith("aileron") for n in asset.geomNodeTree.getNodes())
 			self.blk = {"fm": {}, **({"helicopter": True} if heli else {})}
 
-		dialog = GlideOptionsDialog(self.mainWindow, defaultOptions(self.blk))
+		from util.wtloadout import presets, slotChoices, weaponLabels
+		from util.i18n import LANGUAGE
+		slots = slotChoices(self.blk or {})
+		labels = weaponLabels(findGameRoot(asset.filePath), LANGUAGE, slots) if slots else {}
+		dialog = GlideOptionsDialog(self.mainWindow, defaultOptions(self.blk), self.item.asset.name, presets(self.blk or {}), slots, self.previewLoadout, labels)
 
 		if dialog.exec_() != QDialog.Accepted:
 			return False
 
 		self.options = dialog.options()
+		self.skinArchives = self.options.pop("skins", [])
 
 		if self.options.get("aircraft", isAircraft(self.blk)):
 			self.blk = dict(self.blk or {}, fm = (self.blk or {}).get("fm") or {})
@@ -833,12 +888,35 @@ class ExportToGlide(ExportToSource):
 		elif isAircraft(self.blk):
 			self.blk = None
 
-		return super().preRun()
+		return SaveAction.preRun(self)
+
+	def compileTargets(self, qc):
+		if self.splitNozzles:
+			from util.sourceparts import split
+			parts = split(qc)
+			name = self.item.asset.name
+			targets = [(parts / "body.qc", name), (parts / "nozzles.qc", name + "_nozzles")]
+		else:
+			targets = super().compileTargets(qc)
+		if self.loadout:
+			from util.wtweapons import compileMissiles
+			targets += compileMissiles(targets[0][0], self.loadout)
+		return targets
 
 	def prepareSourceModel(self, smdl):
+		self.splitNozzles = False
+		self.loadout = []
 		if isAircraft(self.blk):
+			if self.options.get("loadout"):
+				from util.wtloadout import apply
+				self.loadout = apply(smdl.model, self.blk, self.options["loadout"], findGameRoot(self.item.asset.filePath), self.keepBones)
+			else:
+				smdl.model.removeObjects(aircraftHiddenNodes([o.name for o in smdl.model], self.blk))
+			boneCount = len(smdl.model.skeleton.getReducedBones(self.keepBones)[0]) if smdl.model.skeleton else 0
+			self.splitNozzles = boneCount > 256
+			if self.splitNozzles:
+				log.log(f"{boneCount} aircraft bones exceed Source's 256 limit; splitting body and animated nozzles")
 			smdl.collisionNodeFilter = aircraftCollisionNodes
-			smdl.model.removeObjects(aircraftHiddenNodes([o.name for o in smdl.model], self.blk))
 			self.surfaces = controlSurfaces(smdl.model)
 			self.tracks = {"l": ((), 0.0), "r": ((), 0.0)}
 
@@ -879,7 +957,7 @@ class ExportToGlide(ExportToSource):
 
 		skeleton = self.smdl.model.skeleton
 		self.setTaskStatus(tr("Extracting War Thunder sounds"))
-		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk, self.tracks, self.options, findGameRoot(asset.filePath), self.a2d, self.surfaces, SETTINGS.getValue(SETTINGS_VTFCMD_PATH) or VTFCMD_PATH)
+		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk, self.tracks, self.options, findGameRoot(asset.filePath), self.a2d, self.surfaces, SETTINGS.getValue(SETTINGS_VTFCMD_PATH) or VTFCMD_PATH, nozzleModel = f"models/{self.modelPath}/{name}_nozzles.mdl" if self.splitNozzles else None, loadout = self.loadout)
 		log.log(f"Glide addon written to {addonDir}")
 
 class ExportLODsToSource(ExportToSource):
