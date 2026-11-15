@@ -31,17 +31,18 @@ class AssetCacher:
 		
 		assetClass = type(asset)
 		
-		if assetClass in cls.__cachedAssets.keys():
+		if assetClass not in cls.__cachedAssets:
 			return
 		
 		classCache:dict = cls.__cachedAssets[assetClass]
 		name = asset.name
 
-		if not name in classCache.keys():
+		if name not in classCache:
 			return
 		
 		nameCache:list = classCache[name]
-		nameCache.pop(nameCache.index(asset))
+		if asset in nameCache:
+			nameCache.remove(asset)
 	
 	@classmethod
 	def clearCache(cls, assetClass:type[Exportable] = None):

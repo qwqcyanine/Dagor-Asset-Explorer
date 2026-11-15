@@ -788,7 +788,7 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 		
 		vdCnt = len(self.__gvdata)
 
-		if idx < 0 or idx > vdCnt:
+		if idx < 0 or idx >= vdCnt:
 			raise ValueError(f"Impossible vData ID {idx} (vdCnt = {vdCnt})")
 		
 		file = self.__file

@@ -21,6 +21,7 @@ from parse.mesh import MatVData, InstShaderMeshResource, ShaderMesh
 from parse.material import MaterialData, MaterialTemplateLibrary,  computeMaterialNames, TexturePathDict
 from abc import abstractmethod, ABC
 from math import sqrt
+import re
 
 
 PHYSMAT_TO_SURFACEPROP = {
@@ -381,6 +382,18 @@ class SourceModel(Terminable):
 		self.__model:Model = model
 		self.__allLODs:tuple[Model] = allLODs
 		self.__collision:CollisionGeom = collision
+		self.__collisionSmdName:str = None
+
+	@staticmethod
+	def _safeSmdStem(name:str, used:set[str]):
+		stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).rstrip(" .") or "mesh"
+		candidate = stem
+		suffix = 1
+		while candidate.lower() in used:
+			candidate = f"{stem}_{suffix}"
+			suffix += 1
+		used.add(candidate.lower())
+		return candidate
 	
 	def getQC(self, customPath:str, smdNames:dict[str, list[str]], lodSmdNames:list[tuple[float, dict[str, list[str]]]] = []):
 		lines = [
@@ -425,7 +438,8 @@ class SourceModel(Terminable):
 
 
 		if self.__collision is not None:
-			lines.append(f'$collisionmodel "{self.__collision.name}.smd"')
+			colName = self.__collisionSmdName or self.__collision.name
+			lines.append(f'$collisionmodel "{colName}.smd"')
 			lines.append("{")
 			lines.append("\t$automass")
 			lines.append("\t$concave")
@@ -463,34 +477,38 @@ class SourceModel(Terminable):
 
 		log.log(f"Wrote {len(data)} bytes to {filepath}")
 
-	def writeSMDs(self, outpath:str, model, skeSMD:str, lodIdx:int = 0):
+	def writeSMDs(self, outpath:str, model, skeSMD:str, lodIdx:int = 0, usedNames:set[str] = None):
 		model:Model = model
+		usedNames = set() if usedNames is None else usedNames
 
 		self.setSubTask(model)
 		SMDs = model.getSMD(f"_lod{lodIdx}" if lodIdx > 0 else "", boneMap = self.__boneMap)
 
 		smdNames:dict[str, list[str]] = {}
-
-		for smd in SafeIter(self, SMDs):
-			if not smd.baseName in smdNames:
-				smdNames[smd.baseName] = []
-			
-			smdNames[smd.baseName].append(smd.name)
-
 		self.clearSubTask()
 
 		fullSMD = "\n".join(("version 1", skeSMD))
 
+		collisionSmd = None
 		if self.__collision is not None and lodIdx == 0:
 			self.setSubTask(self.__collision)
 			colMdl = self.__collision.getModel(singleMesh = True, nodeFilter = self.collisionNodeFilter)
 			self.setSubTask(colMdl)
-			SMDs.append(colMdl.getSMD(dontSplit = True)[0])
+			collisionSmd = colMdl.getSMD(dontSplit = True)[0]
+			SMDs.append(collisionSmd)
 
 		for smd in SafeIter(self, SMDs):
 			smd:SMD
+			fileStem = self._safeSmdStem(smd.name, usedNames)
 
-			log.log(f"Generating {smd.name}.smd")
+			if smd is collisionSmd:
+				self.__collisionSmdName = fileStem
+			else:
+				if not smd.baseName in smdNames:
+					smdNames[smd.baseName] = []
+				smdNames[smd.baseName].append(fileStem)
+
+			log.log(f"Generating {fileStem}.smd")
 			log.addLevel()
 			
 			self.setSubTask(smd)
@@ -508,7 +526,7 @@ class SourceModel(Terminable):
 
 			self.clearSubTask()
 			
-			self.__writeFile__(path.join(outpath, f"{smd.name}.smd"), smdStr)
+			self.__writeFile__(path.join(outpath, f"{fileStem}.smd"), smdStr)
 			log.subLevel()
 
 		return smdNames
@@ -654,12 +672,13 @@ class SourceModel(Terminable):
 				self.writeTinyTriangle(outpath)
 			
 			lodSmdNames:list[tuple[float, dict[str, list[str]]]] = []
+			usedSmdNames:set[str] = {"tinytriangle"} if self.__allLODs is not None else set()
 
 			for lodId, model in SafeEnumerate(self, allLods):
 				log.log(f"Exporting LOD {lodId} SMDs")
 				log.addLevel()
 
-				tempSmdNames = self.writeSMDs(outpath, model, skeSMD, lodId)
+				tempSmdNames = self.writeSMDs(outpath, model, skeSMD, lodId, usedSmdNames)
 
 				if lodId == 0:
 					smdNames = tempSmdNames
@@ -1003,7 +1022,10 @@ class Model(Terminable):
 		
 		for i in SafeRange(self, self.vertCnt):
 			normal = normals[i]
-			normalize(normal)
+			if normal is None:
+				normal = (0.0, 0.0, 0.0)
+			else:
+				normalize(normal)
 
 			vertBuffer.write(pack("fff", *self.__vertices[i]))
 			normalBuffer.write(pack("fff", *normal))
@@ -2696,12 +2718,14 @@ class CollisionGeom(RealResData, ModelContainer):
 		return "default"
 
 	def getSkeleton(self):
-		suffix = "skeleton"
+		parts = self.name.split("_")
+		base = "_".join(parts[:-1]) if len(parts) > 1 else self.name
+		assets = AssetCacher.getCachedAsset(GeomNodeTree, f"{base}_skeleton")
+		if not assets and base != self.name:
+			assets = AssetCacher.getCachedAsset(GeomNodeTree, f"{self.name}_skeleton")
 
-		assets = AssetCacher.getCachedAsset(GeomNodeTree, f"{'_'.join(self.name[:-1])}{suffix}")
-		
 		if not assets or assets == []:
-			log.log(f"Could not find '{suffix}' asset", LOG_WARN)
+			log.log("Could not find 'skeleton' asset", LOG_WARN)
 
 			return None
 		else:

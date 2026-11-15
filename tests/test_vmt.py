@@ -114,7 +114,7 @@ class VMTTest(unittest.TestCase):
                 key = 'pod_a' if cutout else 'pod_am'
                 self.assertEqual(paths.get(key).texType, TEXTURE_GENERIC if cutout else TEXTURE_MASKED)
                 out, _ = mat.convertTex('pod_a', buf.getvalue(), paths, texN=key)
-                alpha = list(Image.open(BytesIO(out)).convert('RGBA').getchannel('A').getdata())
+                alpha = list(Image.open(BytesIO(out)).convert('RGBA').getchannel('A').get_flattened_data())
                 self.assertEqual(alpha, [0,64,192,255] if cutout else [255,191,63,0])
                 if cutout:
                     self.assertIn('$alphatest 1', vmt)

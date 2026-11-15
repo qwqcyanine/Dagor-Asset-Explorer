@@ -285,6 +285,16 @@ class CustomOpenGL(QOpenGLWidget):
 		self.distance = max(self.distance, self.radius * 0.05)
 		self.update()
 
+	def cleanupGL(self):
+		texIds = [t for t in self.textures if t]
+		if texIds:
+			self.makeCurrent()
+			try:
+				GL.glDeleteTextures(texIds)
+			finally:
+				self.doneCurrent()
+		self.textures.clear()
+
 
 class PreviewDialog(QDialog):
 	def __init__(self, parent, title:str, parts:list[MeshPart], markers=()):
@@ -298,4 +308,8 @@ class PreviewDialog(QDialog):
 		self.gl:CustomOpenGL
 		self.gl.markers = markers
 		self.gl.setParts(parts)
+
+	def closeEvent(self, event):
+		self.gl.cleanupGL()
+		super().closeEvent(event)
 

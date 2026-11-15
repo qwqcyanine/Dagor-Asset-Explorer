@@ -25,7 +25,6 @@ from struct import pack
 MAPUI_PATH = getUIPath("mapWidget.ui")
 
 class CellButton(QPushButton):
-	selectedCount = 0
 	postClick = pyqtSignal()
 
 	def __init__(self, name:str, checkable:bool):
@@ -47,15 +46,7 @@ class CellButton(QPushButton):
 		return self.__checked
 	
 	def onClick(self):
-		if self.__checked:
-			self.setChecked(False)
-			CellButton.selectedCount -= 1
-			self.__checked = False
-		else:
-			self.__checked = True
-			self.setChecked(True)
-			CellButton.selectedCount += 1
-		
+		self.__checked = self.isChecked()
 		self.postClick.emit()
 
 def getCellDataByXY(cellData:list, xy:tuple[int, int]):
@@ -159,22 +150,23 @@ class MapTab(QWidget):
 			self.mainWindow.loadMap(path, self.enlistedMap.isChecked())
 	
 	def buttonDragEvent(self, event):
-		if self.getEventPath(event.mimeData()) == False:
+		if not self.getEventPath(event.mimeData()):
 			event.ignore()
 		else:
 			event.accept()
 
 	def getEventPath(self, data:QMimeData):
-		if data.hasText():
-			text = data.text()
+		if data.hasUrls():
+			urls = [u.toLocalFile() for u in data.urls() if u.isLocalFile()]
 
-			paths = text.split("\n")
+			if len(urls) == 1 and path.exists(urls[0]):
+				return urls[0]
+
+		if data.hasText():
+			paths = [p.strip() for p in data.text().splitlines() if p.strip()]
 
 			if len(paths) == 1:
-				fpath = paths[0]
-
-				if fpath[:8] == "file:///":
-					fpath = fpath[8:]
+				fpath = paths[0][8:] if paths[0].startswith("file:///") else paths[0]
 
 				if path.exists(fpath):
 					return fpath
@@ -192,20 +184,23 @@ class MapTab(QWidget):
 			self.mainWindow.openLevelFile(self.enlistedMap.isChecked())
 	
 	def clearGrid(self):
+		self.cellsToExport.clear()
+		self.exportButton.setEnabled(False)
 		for i in reversed(range(self.gridLayout.count())):
-			self.gridLayout.itemAt(i).widget().setParent(None)
+			widget = self.gridLayout.itemAt(i).widget()
+			if widget is not None:
+				self.gridLayout.removeWidget(widget)
+				widget.setParent(None)
+				widget.deleteLater()
 
-	def toggleExportButton(self, cellIdx:int = None):
-		if self.map is None or CellButton.selectedCount == 0:
-			self.exportButton.setEnabled(False)
-
-			if cellIdx is not None:
-				self.cellsToExport.remove(cellIdx)
-		else:
-			self.exportButton.setEnabled(True)
-
-			if cellIdx is not None:
+	def toggleExportButton(self, cellIdx:int = None, btn:CellButton = None):
+		if cellIdx is not None and btn is not None:
+			if btn.checked:
 				self.cellsToExport.add(cellIdx)
+			else:
+				self.cellsToExport.discard(cellIdx)
+
+		self.exportButton.setEnabled(self.map is not None and len(self.cellsToExport) > 0)
 		
 	def mapLoadFinished(self, map:DagorBinaryLevelData, cellData:list):
 		self.map = map
@@ -240,7 +235,7 @@ class MapTab(QWidget):
 
 				btn = CellButton(f"{x} ; {y}{text}", checkable)
 
-				btn.postClick.connect(partial(self.toggleExportButton, cellIdx))
+				btn.postClick.connect(partial(self.toggleExportButton, cellIdx, btn))
 				
 				self.gridLayout.addWidget(btn, y - minXY[1], x - minXY[0])
 

@@ -435,35 +435,28 @@ class DDSxTexturePack2(Pack): # TODO: Add logs
 	def __readDDSx__(self, file:BinFile, id:int):
 		name = self.__nameMap[id]
 
-		log.log(f"Pulling {id}:{name} from {self.name}.dxp.bin")
-		log.addLevel()
-
 		file.seek(self.__ddsxHeadersOfs + id * DDSX_HEADER_SIZE, 0)
 
 		header = DDSx.Header(BinFile(file.read(DDSX_HEADER_SIZE)))
 
 		ddsx = None
 
-		if header.packedSz == 0:
-			log.log(f"Ignoring null sized DDSx")
-		else:
+		if header.packedSz != 0:
 			file.seek(self.__ddsxRecordsOfs + id * 0x18, 0) # 0x18
 
 			offset = readInt(file)
 			
 			ddsx = DDSx(self.filePath, name, header.memSz, offset, header)
 
-		log.subLevel()
-
 		return ddsx
 	
 	def getDDSxById(self, id:int):
-		assert id >= 0 and id <= len(self.__files)
+		assert 0 <= id < len(self.__files)
 
 		return self.__files[id]
 	
 	def getDDSxByName(self, name:str):
-		for k, v in SafeRange(self, self.__nameMap):
+		for k, v in SafeEnumerate(self, self.__nameMap):
 			if v == name:
 				return self.getDDSxById(k)
 				
@@ -1057,10 +1050,10 @@ class MaterialTemplateLibrary(Terminable):
 				self.setParam("d", matParams["opacity"])
 
 			if material.diffuse is not None:
-				self.setParam("map_Kd", "textures/" + material.diffuse[:-1] + ".dds")
+				self.setParam("map_Kd", "textures/" + MaterialData.getTexFileName(material.diffuse) + ".dds")
 			
 			if material.normal is not None:
-				self.setParam("map_bump", "textures/" + material.normal[:-1] + ".dds")
+				self.setParam("map_bump", "textures/" + MaterialData.getTexFileName(material.normal) + ".dds")
 
 			if len(material.detail) > 0:
 				self.setParam("decal ", material.getName() + "_detail")

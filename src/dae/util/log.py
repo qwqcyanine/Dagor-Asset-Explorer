@@ -5,28 +5,22 @@ sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
 from time import time
 from util.enums import *
-from threading import currentThread
+from threading import current_thread, local
 
 startTime = time()
 
 def getTime():
 	return "%08.4f" % (time() - startTime)
 
-curLevel = 0
-levelStr = ""
+_state = local()
+
+def _getLevel() -> int:
+	return getattr(_state, "curLevel", 0)
 
 def incrLevel(level:int = 0):
-	global curLevel
-	global levelStr
-
-	curLevel += level
-	levelStr = ""
-
-	if curLevel < 0:
-		raise Exception(f"Impossible level {curLevel}")
-
-	for i in range(curLevel):
-		levelStr += "    "
+	cur = max(0, _getLevel() + level)
+	_state.curLevel = cur
+	_state.levelStr = "    " * cur
 
 def addLevel(level:int = 1):
 	incrLevel(level)
@@ -34,14 +28,18 @@ def addLevel(level:int = 1):
 def subLevel(level:int = 1):
 	incrLevel(-level)
 
-
 def getLevelStr():
-	global levelStr
+	return getattr(_state, "levelStr", "")
 
-	return levelStr
+def __getattr__(name:str):
+	if name == "curLevel":
+		return _getLevel()
+	if name == "levelStr":
+		return getLevelStr()
+	raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-def log(message:str, type:int = 0): # TODO: add multithreading support
-	print(f"{getTime()} [{currentThread().ident}] ", end = "")
+def log(message:str, type:int = 0):
+	print(f"{getTime()} [{current_thread().ident}] ", end = "")
 
 	if type == LOG_DEBUG: # could use a switch statement here
 		print("[D]", end = "")

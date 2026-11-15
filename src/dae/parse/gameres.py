@@ -323,7 +323,7 @@ class GameResourcePack(Pack): # may need cleanup / TODO: rewrite like DXP2
 		return len(self.__realResEntries)
 	
 	def getRealResource(self, realResId:int):
-		assert realResId >= 0 and realResId <= len(self.__realResEntries)
+		assert 0 <= realResId < len(self.__realResEntries)
 
 		return self.__realResEntries[realResId].getRealResData()
 	

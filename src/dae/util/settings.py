@@ -5,9 +5,11 @@ from os import path
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
 from json import loads, dumps
+import shutil
 from util.decompression import lzmaCompress, lzmaDecompress
 from util.misc import ROOT_FOLDER
 from util.enums import *
+import util.log as log
 
 compressSettings = False
 
@@ -72,15 +74,17 @@ class Settings:
 		if not path.isfile(fpath):
 			self.resetSettings()
 		else:
-			f = open(fpath, "rb")
-			
 			try:
-				settings = None
+				with open(fpath, "rb") as f:
+					raw = f.read()
 
 				if compressSettings:
-					settings = loads(lzmaDecompress(f.read()))
+					settings = loads(lzmaDecompress(raw))
 				else:
-					settings = loads(f.read().decode("utf-8"))
+					settings = loads(raw.decode("utf-8"))
+
+				if not isinstance(settings, dict):
+					raise ValueError("Settings root must be a JSON object")
 				
 				settingsKeys = settings.keys()
 
@@ -98,10 +102,13 @@ class Settings:
 
 				if shouldSave == True:
 					self.saveSettings()
-			except:
+			except Exception as exc:
+				try:
+					shutil.copy2(fpath, fpath + ".bak")
+				except OSError:
+					pass
+				log.log(f"Failed to load settings from {fpath} ({exc}); backed up to {fpath}.bak and reset", LOG_WARN)
 				self.resetSettings()
-			finally:
-				f.close()
 	
 	def __init__(self):
 		fpath = ROOT_FOLDER + "\\settings.json"

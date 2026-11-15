@@ -3,12 +3,8 @@ import unittest
 import sys
 import tempfile
 
-SOURCE = Path(__file__).resolve().parents[1] / 'res/experimental/mig29_volume'
-sys.path.insert(0, str(SOURCE))
-from install_sukhoi import component_patch
-sys.path.pop(0)
-
 from util import sourceparts as splitter
+from util.sourceparts import component_patch
 
 
 class SukhoiSplitTests(unittest.TestCase):
@@ -18,7 +14,7 @@ class SukhoiSplitTests(unittest.TestCase):
             local bone = self.wtBones[n.bone]
 self:ManipulateBonePosition( bone, LerpVector
 self:ManipulateBoneAngles( bone, LerpAngle'''
-        patched = component_patch(text, 'su_33')
+        patched = component_patch(text, 'models/wt_glide/su_33_nozzles.mdl')
         self.assertIn('su_33_nozzles.mdl', patched)
         self.assertIn('self.wtNozzleModel:SetupBones()', patched)
         self.assertIn('self.wtNozzleModel:SetSkin(self:GetSkin())', patched)
@@ -28,7 +24,7 @@ self:ManipulateBoneAngles( bone, LerpAngle'''
         self.assertNotIn('if not bone', patched)
         self.assertIn('self.wtNozzleModel:Remove()', patched)
         with self.assertRaises(AssertionError):
-            component_patch('unexpected entity layout', 'su_33')
+            component_patch('unexpected entity layout', 'models/wt_glide/su_33_nozzles.mdl')
 
     def test_both_components_keep_skin_families_after_collision(self):
         group = '$texturegroup "skinfamilies"\n{\n { "metal" }\n { "skins/custom/metal" }\n}\n'
