@@ -924,10 +924,6 @@ class ExportToGlide(ExportToSource):
 		self.options = dialog.options()
 		self.skinArchives = self.options.pop("skins", [])
 		try:
-			if self.options.get("cockpit"):
-				from util.wtcockpit import cockpitPack
-				cockpitPack(findGameRoot(asset.filePath), asset.name)
-
 			if self.options.get("aircraft", isAircraft(self.blk)):
 				self.blk = dict(self.blk or {}, fm = (self.blk or {}).get("fm") or {})
 				if self.options.get("helicopter"):
@@ -1008,26 +1004,6 @@ class ExportToGlide(ExportToSource):
 		if blk is None:
 			log.log(f"No War Thunder tank blk found for {name}, using default stats")
 
-		cockpit = ""
-		if self.options.get("cockpit"):
-			from util.wtcockpit import exportCockpit
-			self.setTaskStatus(tr("Exporting experimental cockpit"))
-			def runCockpit(command):
-				if self.shouldTerminate:
-					raise InterruptedError("Cockpit export cancelled")
-				process = Popen(command)
-				self.setSubProcess(process)
-				try:
-					result = process.wait()
-				finally:
-					self.clearSubProcess(process)
-				if self.shouldTerminate:
-					raise InterruptedError("Cockpit export cancelled")
-				if result:
-					raise RuntimeError(f"Cockpit tool failed ({result}): {command[0]}")
-			cockpit = exportCockpit(findGameRoot(asset.filePath), name, path.join(output, name, "cockpit"),
-				path.join(output, name, "source_export"), SETTINGS.getValue(SETTINGS_STUDIOMDL_PATH),
-				SETTINGS.getValue(SETTINGS_GAMEINFO_PATH), SETTINGS.getValue(SETTINGS_VTFCMD_PATH) or VTFCMD_PATH, runCockpit)
 		shutil.copytree(path.join(output, name, "source_export"), addonDir, dirs_exist_ok = True)
 		matDir = path.join(addonDir, self.smdl.getMaterialsDir(self.modelPath))
 
@@ -1040,7 +1016,7 @@ class ExportToGlide(ExportToSource):
 
 		skeleton = self.smdl.model.skeleton
 		self.setTaskStatus(tr("Extracting War Thunder sounds"))
-		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk, self.tracks, self.options, findGameRoot(asset.filePath), self.a2d, self.surfaces, SETTINGS.getValue(SETTINGS_VTFCMD_PATH) or VTFCMD_PATH, nozzleModel = f"models/{self.modelPath}/{name}_nozzles.mdl" if self.splitNozzles else None, loadout = self.loadout, cockpit = cockpit, labels = getattr(self, "weaponLabels", None))
+		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk, self.tracks, self.options, findGameRoot(asset.filePath), self.a2d, self.surfaces, SETTINGS.getValue(SETTINGS_VTFCMD_PATH) or VTFCMD_PATH, nozzleModel = f"models/{self.modelPath}/{name}_nozzles.mdl" if self.splitNozzles else None, loadout = self.loadout, labels = getattr(self, "weaponLabels", None))
 		log.log(f"Glide addon written to {addonDir}")
 
 class ExportLODsToSource(ExportToSource):

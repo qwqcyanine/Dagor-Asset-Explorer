@@ -2012,7 +2012,7 @@ if SERVER then
 end
 '''
 
-def writeAddon(addonDir:str, className:str, printName:str, modelPath:str, skeleton, blk:dict, tracks:dict = None, options:dict = None, gameRoot:str = None, a2d = None, surfaces:list = None, vtfCmd:str = None, nozzleModel:str = None, loadout:list = None, cockpit:str = "", labels:dict = None):
+def writeAddon(addonDir:str, className:str, printName:str, modelPath:str, skeleton, blk:dict, tracks:dict = None, options:dict = None, gameRoot:str = None, a2d = None, surfaces:list = None, vtfCmd:str = None, nozzleModel:str = None, loadout:list = None, labels:dict = None):
 	entDir = path.join(addonDir, "lua", "entities")
 	makedirs(entDir, exist_ok = True)
 	sounds = {}
@@ -2038,7 +2038,6 @@ def writeAddon(addonDir:str, className:str, printName:str, modelPath:str, skelet
 		if nozzleModel:
 			from util.sourceparts import component_patch
 			lua = component_patch(lua, nozzleModel)
-		lua += cockpit
 		with open(path.join(entDir, f"{className}.lua"), "w", encoding = "utf-8") as f:
 			f.write(lua)
 	elif gameRoot and blk:
