@@ -19,6 +19,141 @@ def exportDisplayArtwork(gameRoot, materialsDir):
             image.convert('RGBA').save(target / (name + '.png'))
 
 
+def cockpitPack(gameRoot, modelName):
+    """Only J-16 has calibrated geometry filtering, eye position and instrument layout."""
+    if modelName != 'j_16':
+        raise ValueError('Experimental cockpit currently supports J-16 only')
+    if not gameRoot:
+        raise FileNotFoundError('Experimental cockpit requires installed WT HQ cockpit data (War Thunder root not found)')
+    pack = Path(gameRoot) / 'content.hq/pkg_cockpits/res/pkg_cockpits_aircrafts/j_16.grp'
+    for required in (pack, pack.parent.parent / 'dynModelDesc.bin',
+                     Path(gameRoot) / 'ui/atlases.vromfs.bin'):
+        if not required.is_file():
+            raise FileNotFoundError(f'Experimental cockpit requires installed WT HQ cockpit data: {required}')
+    return pack
+
+
+def exportCockpit(gameRoot, modelName, output, addonDir, compiler, gameInfo, converter, run):
+    """Build in a private compiler game, then collect everything into the normal addon.
+
+    run(argv) is the export action's cancellable, checked subprocess runner.
+    No installed game files or standalone test scripts are used as input/output.
+    """
+    import shutil
+    from parse.gameres import GameResourcePack, GameResDesc
+    from parse.realres import DynModel, SourceModel
+    from parse.material import DDSx, DDSxTexturePack2
+    from util.assetcacher import AssetCacher
+    from util.a2d import A2D
+    from util.vromfs import VROMFS
+
+    root, output, addon = Path(gameRoot), Path(output).resolve(), Path(addonDir)
+    pack = cockpitPack(root, modelName)
+    for filename in (compiler, gameInfo, converter):
+        if not Path(filename).is_file():
+            raise FileNotFoundError(filename)
+    for filename in (root / 'content/base/res/dynModelDesc.bin', pack.parent.parent / 'dynModelDesc.bin'):
+        desc = GameResDesc(str(filename))
+        desc.loadDataBlock()
+        AssetCacher.appendGameResDesc(desc)
+    assets = GameResourcePack(str(pack)).getPackedFiles()
+    for asset in assets:
+        AssetCacher.cacheAsset(asset)
+    dyn = next(a for a in assets if isinstance(a, DynModel) and a.name == modelName + '_cockpit')
+    model = dyn.getModel(0)
+    keep, report = prepareInterior(model)
+    controls = stickPoses(model.skeleton, A2D.fromPack(str(pack), modelName + '_cockpit_anim'))
+    head = VROMFS(str(root / 'aces.vromfs.bin')).readBlk(
+        'gamedata/flightmodels/' + modelName + '.blk')['cockpit']['headPos']
+    wanted = {t.split('*')[0] for m in model.materials for t in m.getTextureSlots() if t}
+    if wanted:
+        for folder in ('content.hq/hq_tex/res', 'content.hq/pkg_cockpits/res'):
+            for filename in (root / folder).rglob('*.dxp.bin'):
+                for asset in DDSxTexturePack2(str(filename)).getPackedFiles():
+                    if asset.name in wanted and all(
+                            c.getPixelCnt() < asset.getPixelCnt()
+                            for c in AssetCacher.getCachedAsset(DDSx, asset.name) or ()):
+                        AssetCacher.cacheAsset(asset)
+        missing = {n for n in wanted if not AssetCacher.getCachedAsset(DDSx, n)}
+        if missing:
+            for filename in (root / 'content/base/res').rglob('*.dxp.bin'):
+                if not missing:
+                    break
+                for asset in DDSxTexturePack2(str(filename)).getPackedFiles():
+                    if asset.name in missing:
+                        AssetCacher.cacheAsset(asset)
+                        missing.discard(asset.name)
+    missing = sorted(n for n in wanted if not AssetCacher.getCachedAsset(DDSx, n))
+    if missing:
+        raise ValueError('Missing cockpit textures: ' + ', '.join(missing))
+
+    namespace = 'wt_glide/cockpits/' + modelName
+    smdl = SourceModel(modelName + '_cockpit', model, keepBones=keep)
+    qc, textures = smdl.export(str(output), namespace, False)
+    qc = Path(qc)
+    qc.write_text(qc.read_text().replace('$opaque\n', ''))
+    targets = splitCockpitQC(qc)
+    model.exportTextures(str(qc.parent), texturePaths=textures, forceConvert=True)
+    materials = qc.parent / 'source_export/materials'
+    jobs = []
+    for name, spec in textures.getDict().items():
+        source = qc.parent / 'textures' / (name + '.dds')
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        destination = materials / spec.texPath
+        destination.mkdir(parents=True, exist_ok=True)
+        vtf = destination / (name + '.vtf')
+        vtf.unlink(missing_ok=True)  # VTFCmd can return zero on failure; reject stale output.
+        jobs.append((source, destination, vtf))
+    if jobs:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from threading import Event
+        stop = Event()
+
+        def convert(job):
+            if stop.is_set():
+                return
+            source, destination, vtf = job
+            run([str(converter), '-file', str(source), '-output', str(destination)])
+            if not vtf.is_file():
+                stop.set()
+                raise RuntimeError('VTFCmd did not create cockpit texture: ' + str(vtf))
+
+        if len(jobs) == 1:
+            convert(jobs[0])
+        else:
+            with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as pool:
+                futures = [pool.submit(convert, job) for job in jobs]
+                try:
+                    for future in as_completed(futures):
+                        future.result()
+                except Exception:
+                    stop.set()
+                    raise
+    exportDisplayArtwork(root, materials)
+    # Material flags/tangents must be available before compilation, without polluting GMod.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='cockpit-compile-', dir=output) as folder:
+        stage = Path(folder)
+        shutil.copytree(materials, stage / 'materials')
+        search = Path(gameInfo).resolve().parent.as_posix()
+        (stage / 'gameinfo.txt').write_text(
+            '"GameInfo" { "game" "DAE cockpit compiler" "FileSystem" { "SteamAppId" "4000" '
+            '"SearchPaths" { "Game" "|gameinfo_path|." "Game" "' + search + '" } } }\n')
+        for target in targets:
+            run([str(compiler), '-nop4', '-game', str(stage), str(target)])
+            for suffix in ('.mdl', '.vvd', '.dx90.vtx'):
+                if not (stage / 'models' / namespace / (target.stem + suffix)).is_file():
+                    raise RuntimeError('Missing compiled cockpit output: ' + target.stem + suffix)
+        shutil.copytree(stage / 'models', addon / 'models', dirs_exist_ok=True)
+    shutil.copytree(materials, addon / 'materials', dirs_exist_ok=True)
+    exterior = ['su_27sm_inside', 'su_30sm_seat', 'j_16_interior', 'j_16_blister',
+                'rainbow_coating_05', 'rainbow_light_coating_017', 'dynamic_glass_chrome_017',
+                'dynamic_glass_chrome_06']
+    return cockpitLua([f'models/{namespace}/{t.stem}.mdl' for t in targets],
+                      (head[0] * 40, head[2] * 40, head[1] * 40), report['surfaces'], exterior, controls)
+
+
 def interiorMaterial(name):
     return ('cockpit' in name or name.startswith(('su_gauge_', 'hud_', 'cn_gauge_', 'j_11b_mfd_')))
 

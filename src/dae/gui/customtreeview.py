@@ -1,5 +1,5 @@
 import sys
-from os import path, system, mkdir, makedirs, replace, listdir, rmdir
+from os import path, system, mkdir, makedirs, remove, replace, listdir, rmdir
 
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
@@ -7,14 +7,15 @@ from util.classproperty import classproperty
 
 import shutil
 import util.log as log
-from PyQt5.QtWidgets import QAbstractItemView, QTreeView, QLineEdit, QHeaderView, QMenu, QAction, QStyledItemDelegate, QFileDialog, QMainWindow, QDialog
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QTreeView, QLineEdit, QHeaderView, QMenu, QAction, QStyledItemDelegate, QFileDialog, QMainWindow, QDialog
 from PyQt5.QtCore import QMimeData, Qt, QSortFilterProxyModel, QPoint, QFileInfo, QSize
 from PyQt5.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QStandardItemModel, QStandardItem, QIcon, QPaintEvent, QPainter, QPalette
 from util.misc import formatBytes, getResPath, openFile, ROOT_FOLDER, LIB_FOLDER
 from util.terminable import Exportable, Packed, Pack, Terminable
 from util.enums import *
-from pyperclip import copy as copyToClipboard
 from functools import partial
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Event
 from parse.material import DDSx, DDSxTexturePack2
 from parse.realres import RendInst, DynModel, ModelContainer, GeomNodeTree
 from gui.glideOptionsDialog import GlideOptionsDialog
@@ -258,8 +259,11 @@ class ThreadedAction(CustomAction):
 	def clearTerminable(self):
 		self.item.mainWindow.clearTerminable()
 	
-	def clearSubProcess(self):
-		self.item.mainWindow.clearSubProcess()
+	def clearSubProcess(self, proc = None):
+		if proc is None:
+			self.item.mainWindow.clearSubProcess()
+		else:
+			self.item.mainWindow.clearSubProcess(proc)
 	
 	def handleTermination(self, ter:Terminable):
 		if self.shouldTerminate:
@@ -345,7 +349,7 @@ class OpenParentFileLocation(OpenFileLocation):
 
 class CopyPathToClipboard(CustomAction):
 	def run(self):
-		copyToClipboard(self.item.finfo.absoluteFilePath())
+		QApplication.clipboard().setText(self.item.finfo.absoluteFilePath())
 	
 	@property
 	def actionText(self) -> str:
@@ -355,7 +359,7 @@ class CopyNameToClipboard(CustomAction):
 	item:AssetItem
 
 	def run(self):
-		copyToClipboard(self.item.asset.name)
+		QApplication.clipboard().setText(self.item.asset.name)
 	
 	@property
 	def actionText(self) -> str:
@@ -732,14 +736,16 @@ class ExportToSource(SaveAction):
 		if exportTex and texturePaths is not None:
 			self.setTaskStatus(tr("Exporting textures"))
 			log.addLevel()
-			mdl = smdl.model
+			try:
+				mdl = smdl.model
 
-			if self.handleTermination(mdl):
-				return
-			
-			mdl.exportTextures(output, texturePaths = texturePaths, forceConvert = forceConvert)
-			self.clearTerminable()
-			log.subLevel()
+				if self.handleTermination(mdl):
+					return
+
+				mdl.exportTextures(output, texturePaths = texturePaths, forceConvert = forceConvert)
+				self.clearTerminable()
+			finally:
+				log.subLevel()
 
 			if self.shouldTerminate:
 				return
@@ -747,60 +753,102 @@ class ExportToSource(SaveAction):
 			self.setTaskProgress(4/stepCnt)
 			self.setTaskStatus(tr("Converting textures to VTF"))
 			log.addLevel()
+			try:
+				materialsPath = path.join(sourceExport, "materials")
 
-			materialsPath = path.join(sourceExport, "materials")
+				texDict = texturePaths.getDict()
+				totalTex = len(texDict)
+				jobs = []
 
-			texDict = texturePaths.getDict()
+				for k, texName in enumerate(texDict.keys()):
+					if self.shouldTerminate:
+						return
 
-			for k, texName in enumerate(texDict.keys()):
-				if self.shouldTerminate:
-					return
-				
-				texFile = path.join(output, f"textures/{texName}.dds")
+					texFile = path.join(output, f"textures/{texName}.dds")
 
-				if not path.exists(texFile):
-					log.log(f"Skipping missing texture {texName}")
+					if not path.exists(texFile):
+						log.log(f"Skipping missing texture {texName}")
 
-					continue
-				
-				tex = texturePaths.get(texName)
+						continue
 
-				texOutPath = path.normpath(path.join(materialsPath, tex.texPath))
+					tex = texturePaths.get(texName)
 
-				if dontReplaceTex and path.exists(path.join(texOutPath, f"{texName}.vtf")):
-					log.log(f"Skipping already exported texture {texName}")
+					texOutPath = path.normpath(path.join(materialsPath, tex.texPath))
+					vtfFile = path.join(texOutPath, f"{texName}.vtf")
 
-					continue
+					if dontReplaceTex and path.exists(vtfFile):
+						log.log(f"Skipping already exported texture {texName}")
 
-				makedirs(texOutPath, exist_ok = True)
+						continue
 
-				pipes = Popen((
-					vtfCmd,
-					"-file",
-					path.normpath(texFile),
-					"-output",
-					texOutPath
-				))
+					makedirs(texOutPath, exist_ok = True)
+					if path.exists(vtfFile):
+						remove(vtfFile)
 
-				self.setSubProcess(pipes)
+					jobs.append((k, texName, texFile, texOutPath, vtfFile))
 
-				pipes.wait()
+				if jobs:
+					stop = Event()
 
-				self.clearSubProcess()
+					def convertOne(job):
+						_, texName, texFile, texOutPath, vtfFile = job
+						if stop.is_set() or self.shouldTerminate:
+							return False
 
-				self.setTaskProgress((4 + (k + 1) / len(texDict))/stepCnt)
+						pipes = Popen((
+							vtfCmd,
+							"-file",
+							path.normpath(texFile),
+							"-output",
+							texOutPath
+						))
 
-			if exportToGame and path.exists(materialsPath):
-				log.log("Moving materials directory...")
+						self.setSubProcess(pipes)
+						try:
+							ret = pipes.wait()
+						finally:
+							try:
+								self.clearSubProcess(pipes)
+							except TypeError:
+								self.clearSubProcess()
 
-				shutil.copytree(materialsPath, path.join(gamePath, "materials"), dirs_exist_ok = True)
-				shutil.rmtree(materialsPath)
-			
+						if stop.is_set() or self.shouldTerminate:
+							return False
+						if ret != 0 or not path.isfile(vtfFile):
+							stop.set()
+							raise RuntimeError(f"VTFCmd failed for {texName} (return code {ret}): {vtfFile}")
+						return True
 
-			if len(listdir(sourceExport)) == 0:
-				rmdir(sourceExport)
+					if len(jobs) == 1:
+						if not convertOne(jobs[0]) or self.shouldTerminate:
+							return
+						self.setTaskProgress((4 + (jobs[0][0] + 1) / totalTex) / stepCnt)
+					else:
+						with ThreadPoolExecutor(max_workers = min(4, len(jobs))) as pool:
+							futures = [pool.submit(convertOne, job) for job in jobs]
+							completed = 0
+							try:
+								for future in as_completed(futures):
+									if not future.result() or self.shouldTerminate:
+										stop.set()
+										return
+									completed += 1
+									self.setTaskProgress((4 + completed / len(jobs)) / stepCnt)
+							except Exception:
+								stop.set()
+								raise
 
-			log.subLevel()
+				if exportToGame and path.exists(materialsPath):
+					log.log("Moving materials directory...")
+
+					shutil.copytree(materialsPath, path.join(gamePath, "materials"), dirs_exist_ok = True)
+					shutil.rmtree(materialsPath)
+
+
+				if len(listdir(sourceExport)) == 0:
+					rmdir(sourceExport)
+			finally:
+				log.subLevel()
 			self.setTaskProgress(5/stepCnt)
 
 	@classproperty
@@ -849,18 +897,25 @@ class ExportToGlide(ExportToSource):
 
 	def preRun(self):
 		asset:DynModel = self.item.asset
-		self.blk = findAircraftBlk(asset.filePath, asset.name) or findTankBlk(asset.filePath, asset.name)
-		self.a2d = self.surfaces = None
-		asset.computeData()
+		try:
+			self.blk = findAircraftBlk(asset.filePath, asset.name) or findTankBlk(asset.filePath, asset.name)
+			self.a2d = self.surfaces = None
+			asset.computeData()
 
-		if self.blk is None and asset.geomNodeTree is not None and aircraftKeepBones(asset.geomNodeTree) and not asset.geomNodeTree.getNodeByName("bone_turret"):
-			heli = asset.geomNodeTree.getNodeByName("prop01_2") is not None and not any(n.name.startswith("aileron") for n in asset.geomNodeTree.getNodes())
-			self.blk = {"fm": {}, **({"helicopter": True} if heli else {})}
+			if self.blk is None and asset.geomNodeTree is not None and aircraftKeepBones(asset.geomNodeTree) and not asset.geomNodeTree.getNodeByName("bone_turret"):
+				heli = asset.geomNodeTree.getNodeByName("prop01_2") is not None and not any(n.name.startswith("aileron") for n in asset.geomNodeTree.getNodes())
+				self.blk = {"fm": {}, **({"helicopter": True} if heli else {})}
 
-		from util.wtloadout import presets, slotChoices, weaponLabels
-		from util.i18n import LANGUAGE
-		slots = slotChoices(self.blk or {})
-		labels = weaponLabels(findGameRoot(asset.filePath), LANGUAGE, slots) if slots else {}
+			from util.wtloadout import presets, slotChoices, weaponLabels
+			from util.i18n import LANGUAGE
+			slots = slotChoices(self.blk or {})
+			labels = weaponLabels(findGameRoot(asset.filePath), LANGUAGE, slots) if slots else {}
+			self.weaponLabels = labels if slots else None
+		except Exception as error:
+			print(format_exc())
+			MessageBox(str(error)).exec_()
+			return False
+
 		dialog = GlideOptionsDialog(self.mainWindow, defaultOptions(self.blk), self.item.asset.name, presets(self.blk or {}), slots, self.previewLoadout, labels)
 
 		if dialog.exec_() != QDialog.Accepted:
@@ -868,25 +923,33 @@ class ExportToGlide(ExportToSource):
 
 		self.options = dialog.options()
 		self.skinArchives = self.options.pop("skins", [])
+		try:
+			if self.options.get("cockpit"):
+				from util.wtcockpit import cockpitPack
+				cockpitPack(findGameRoot(asset.filePath), asset.name)
 
-		if self.options.get("aircraft", isAircraft(self.blk)):
-			self.blk = dict(self.blk or {}, fm = (self.blk or {}).get("fm") or {})
-			if self.options.get("helicopter"):
-				self.blk["helicopter"] = True
-			else:
-				self.blk.pop("helicopter", None)
+			if self.options.get("aircraft", isAircraft(self.blk)):
+				self.blk = dict(self.blk or {}, fm = (self.blk or {}).get("fm") or {})
+				if self.options.get("helicopter"):
+					self.blk["helicopter"] = True
+				else:
+					self.blk.pop("helicopter", None)
 
-			if asset.collision is None:
-				asset.setCollisionGeom(findAircraftCollision(asset.filePath, asset.name))
+				if asset.collision is None:
+					asset.setCollisionGeom(findAircraftCollision(asset.filePath, asset.name))
 
-			self.keepBones = aircraftKeepBones(asset.geomNodeTree)
+				self.keepBones = aircraftKeepBones(asset.geomNodeTree)
 
-			try:
-				self.a2d = A2D.fromPack(asset.filePath, f"{asset.name}_anim")
-			except Exception as e: # no gear animation then, the gear stays as modelled
-				log.log(f"War Thunder animation unreadable: {e}", 2)
-		elif isAircraft(self.blk):
-			self.blk = None
+				try:
+					self.a2d = A2D.fromPack(asset.filePath, f"{asset.name}_anim")
+				except Exception as e: # no gear animation then, the gear stays as modelled
+					log.log(f"War Thunder animation unreadable: {e}", 2)
+			elif isAircraft(self.blk):
+				self.blk = None
+		except Exception as error:
+			print(format_exc())
+			MessageBox(str(error)).exec_()
+			return False
 
 		return SaveAction.preRun(self)
 
@@ -945,6 +1008,26 @@ class ExportToGlide(ExportToSource):
 		if blk is None:
 			log.log(f"No War Thunder tank blk found for {name}, using default stats")
 
+		cockpit = ""
+		if self.options.get("cockpit"):
+			from util.wtcockpit import exportCockpit
+			self.setTaskStatus(tr("Exporting experimental cockpit"))
+			def runCockpit(command):
+				if self.shouldTerminate:
+					raise InterruptedError("Cockpit export cancelled")
+				process = Popen(command)
+				self.setSubProcess(process)
+				try:
+					result = process.wait()
+				finally:
+					self.clearSubProcess(process)
+				if self.shouldTerminate:
+					raise InterruptedError("Cockpit export cancelled")
+				if result:
+					raise RuntimeError(f"Cockpit tool failed ({result}): {command[0]}")
+			cockpit = exportCockpit(findGameRoot(asset.filePath), name, path.join(output, name, "cockpit"),
+				path.join(output, name, "source_export"), SETTINGS.getValue(SETTINGS_STUDIOMDL_PATH),
+				SETTINGS.getValue(SETTINGS_GAMEINFO_PATH), SETTINGS.getValue(SETTINGS_VTFCMD_PATH) or VTFCMD_PATH, runCockpit)
 		shutil.copytree(path.join(output, name, "source_export"), addonDir, dirs_exist_ok = True)
 		matDir = path.join(addonDir, self.smdl.getMaterialsDir(self.modelPath))
 
@@ -957,7 +1040,7 @@ class ExportToGlide(ExportToSource):
 
 		skeleton = self.smdl.model.skeleton
 		self.setTaskStatus(tr("Extracting War Thunder sounds"))
-		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk, self.tracks, self.options, findGameRoot(asset.filePath), self.a2d, self.surfaces, SETTINGS.getValue(SETTINGS_VTFCMD_PATH) or VTFCMD_PATH, nozzleModel = f"models/{self.modelPath}/{name}_nozzles.mdl" if self.splitNozzles else None, loadout = self.loadout)
+		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk, self.tracks, self.options, findGameRoot(asset.filePath), self.a2d, self.surfaces, SETTINGS.getValue(SETTINGS_VTFCMD_PATH) or VTFCMD_PATH, nozzleModel = f"models/{self.modelPath}/{name}_nozzles.mdl" if self.splitNozzles else None, loadout = self.loadout, cockpit = cockpit, labels = getattr(self, "weaponLabels", None))
 		log.log(f"Glide addon written to {addonDir}")
 
 class ExportLODsToSource(ExportToSource):
@@ -1199,40 +1282,41 @@ class CustomTreeView(QTreeView):
 	def dropEvent(self, event:QDropEvent):
 		paths = self.getEventPaths(event.mimeData())
 
-		if paths is not None:
-			for i in range(1, len(paths)):
-				path = paths[i]
-
-				if path.startswith("file:///"):
-					paths[i] = path[8:]
-			
+		if paths:
 			self.mainWindow.mountAssets(paths)
 	
 	def getEventPaths(self, data:QMimeData):
+		if data.hasUrls():
+			paths = [u.toLocalFile() for u in data.urls() if u.isLocalFile() and path.exists(u.toLocalFile())]
+			return paths or None
+
 		if data.hasText():
-			text = data.text()
+			paths = []
 
-			paths = text.split("\n")
+			for line in data.text().splitlines():
+				fpath = line.strip()
 
-			for id, fpath in enumerate(paths):
-				if fpath[:8] == "file:///":
+				if not fpath:
+					continue
+
+				if fpath.startswith("file:///"):
 					fpath = fpath[8:]
 
-					paths[id] = fpath
+				if path.exists(fpath):
+					paths.append(fpath)
 
-					if path.exists(fpath):
-						return paths
+			return paths or None
 		
 		return None
 		
 	def dragMoveEvent(self, event:QDragMoveEvent):
-		if self.getEventPaths(event.mimeData()) == False:
+		if not self.getEventPaths(event.mimeData()):
 			event.ignore()
 		else:
 			event.accept()
 
 	def dragEnterEvent(self, event:QDragEnterEvent):
-		if self.getEventPaths(event.mimeData()) == False:
+		if not self.getEventPaths(event.mimeData()):
 			event.ignore()
 		else:
 			event.accept()

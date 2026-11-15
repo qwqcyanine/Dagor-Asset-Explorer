@@ -1,5 +1,5 @@
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QDialog, QWidget, QComboBox, QDoubleSpinBox, QFormLayout, QDialogButtonBox, QPushButton, QScrollArea
+from PyQt5.QtWidgets import QDialog, QWidget, QComboBox, QDoubleSpinBox, QFormLayout, QDialogButtonBox, QPushButton, QScrollArea, QCheckBox
 from util.i18n import tr
 from util.wtloadout import presetLabel
 
@@ -23,6 +23,12 @@ class GlideOptionsDialog(QDialog):
 		initKind = ("heli" if options.get("helicopter") else "plane") if options.get("aircraft") else "ground"
 		self.vehicleType.setCurrentIndex({"ground": 0, "plane": 1, "heli": 2}[initKind])
 		self.form.addRow(tr("Vehicle type"), self.vehicleType)
+
+		self.cockpit = QCheckBox(tr("Experimental HQ cockpit (J-16)"))
+		self.cockpitSupported = modelName == "j_16"
+		self.cockpit.setToolTip(tr("Requires installed WT HQ cockpit data. Adds first-person HUD, MFDs, animated controls and cubemap mirrors; increases export time and rendering cost."))
+		self.cockpit.setChecked(self.cockpitSupported and options.get("cockpit", False))
+		self.form.addRow(self.cockpit)
 
 		self.loadout = QComboBox()
 		self.loadout.addItem(tr("No external weapons"), "")
@@ -118,6 +124,7 @@ class GlideOptionsDialog(QDialog):
 		kind = self.vehicleType.currentData()
 		ground = kind == "ground"
 		plane = kind == "plane"
+		self.cockpit.setEnabled(plane and self.cockpitSupported)
 		self._setRowVisible(self.transmission, ground and not self.wheeled)
 		self._setRowVisible(self.armor, ground)
 		self._setRowVisible(self.loadout, not ground)
@@ -137,6 +144,7 @@ class GlideOptionsDialog(QDialog):
 			return {
 				"skins": self.skins.paths(),
 				"aircraft": True,
+				"cockpit": kind == "plane" and self.cockpitSupported and self.cockpit.isChecked(),
 				"loadout": {index: combo.currentData() for index, combo in self.slotCombos.items()} if self.loadout.currentData() == "__custom__" else self.loadout.currentData(),
 				"reloadTimes": {key: spin.value() for key, spin in self.reloadSpins.items() if spin.value() > 0},
 				"helicopter": kind == "heli",

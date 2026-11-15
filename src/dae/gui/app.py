@@ -28,6 +28,7 @@ from util.enums import *
 from util.terminable import Exportable, Pack, Terminable
 from gui.settingsDialog import SettingsDialog
 from functools import partial
+from threading import Lock
 from traceback import format_exc
 
 # LOADINGGIF_SIZE = QSize(150, 150)
@@ -77,6 +78,7 @@ class MainWindow(QMainWindow):
 	taskTitle = pyqtSignal(str)
 	dialogClosed = pyqtSignal(bool)
 	itemsCreated = pyqtSignal()
+	rowCreated = pyqtSignal(object)
 
 	gridLayout:QGridLayout
 	treeView:CustomTreeView
@@ -114,11 +116,14 @@ class MainWindow(QMainWindow):
 		self.actionSettings.triggered.connect(self.openSettings)
 		self.actionExpand.triggered.connect(self.treeView.expandAll)
 		self.actionCollapse.triggered.connect(self.treeView.collapseAll)
+		self.rowCreated.connect(self.treeView.treeModel.appendRow)
 		self.itemsCreated.connect(self.treeView.expandAll)
 
 		self.threadPool = QThreadPool()
 		self.activeTerminable:Terminable = None
 		self.activeSubProcess = None
+		self._subProcesses = {}
+		self._subProcessLock = Lock()
 		self.shouldTerminate = False
 		self.treeView.mainWindow = self
 		self.__taskStatus:str = ""
@@ -278,10 +283,19 @@ class MainWindow(QMainWindow):
 		self.activeTerminable = None
 	
 	def setSubProcess(self, proc):
-		self.activeSubProcess = proc
+		with self._subProcessLock:
+			if proc is not None:
+				self._subProcesses[id(proc)] = proc
+			self.activeSubProcess = proc
 	
-	def clearSubProcess(self):
-		self.activeSubProcess = None
+	def clearSubProcess(self, proc = None):
+		with self._subProcessLock:
+			if proc is None:
+				self._subProcesses.clear()
+				self.activeSubProcess = None
+			else:
+				self._subProcesses.pop(id(proc), None)
+				self.activeSubProcess = next(iter(self._subProcesses.values()), None)
 
 	def exploreFileInfo(self, finfo:QFileInfo, parent:QStandardItem):
 		if self.shouldTerminate:
@@ -325,7 +339,7 @@ class MainWindow(QMainWindow):
 						else:
 							item:AssetItem = self.getAssetItem(asset, finfo)
 							
-							parent.appendRow(item.getRow())
+							self._appendRow(parent, item.getRow())
 
 							success = True
 					except Exception as ex:
@@ -361,11 +375,17 @@ class MainWindow(QMainWindow):
 						hasFile = True
 				
 				if hasFile:
-					parent.appendRow(item.getRow())
+					self._appendRow(parent, item.getRow())
 
 				return hasFile
 		
 		return False
+
+	def _appendRow(self, parent, row):
+		if parent is self.treeView.treeModel:
+			self.rowCreated.emit(row)
+		else:
+			parent.appendRow(row)
 	
 	def getAssetItem(self, asset:Exportable, finfo:QFileInfo = None, parentAsset:AssetItem = None) -> AssetItem:
 		if asset.iconName is None:
@@ -390,11 +410,19 @@ class MainWindow(QMainWindow):
 		if self.activeTerminable is not None:
 			self.activeTerminable.terminate()
 		
-		if self.activeSubProcess is not None:
-			self.activeSubProcess.kill()
+		with self._subProcessLock:
+			procs = list(self._subProcesses.values())
+			if self.activeSubProcess is not None and id(self.activeSubProcess) not in self._subProcesses:
+				procs.append(self.activeSubProcess)
+		for proc in procs:
+			try:
+				proc.kill()
+			except OSError:
+				pass
 		
 		self.threadPool.waitForDone()
 		self.clearTerminable()
+		self.clearSubProcess()
 
 		self.shouldTerminate = False
 		
