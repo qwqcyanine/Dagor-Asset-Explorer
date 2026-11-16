@@ -84,8 +84,8 @@ def compileMissiles(qcPath, mounts):
 	return targets
 
 
-def missileLua(mounts, reloadTimes=None, *, guns=(), labels=None):
-	"""Use Glide's weapon/HUD/lock-on interface without changing its global classes."""
+def aircraftWeaponBlocks(mounts, reloadTimes=None, *, guns=(), labels=None):
+	"""Return structured Lua snippets for Glide's single CLIENT/SERVER vehicle definition."""
 	import json
 	groups = {}
 	for mount in mounts:
@@ -105,24 +105,24 @@ def missileLua(mounts, reloadTimes=None, *, guns=(), labels=None):
 	weaponInfo = json.dumps(info, ensure_ascii=True).replace("]==]", "\\u005d==\\u005d")
 	data = json.dumps(list(groups.values()), separators=(",", ":"))
 	external = [m for m in mounts if m.get("external")]
-	pods = {m['container'] for m in mounts if m.get('container')}
-	if not pods.issubset({m['prefix'] for m in external}):
-		raise ValueError('Rocket containers require independent shell models')
-	visuals = ''
-	if external:
-		visuals = '''
-if CLIENT then
-    local mounts = util.JSONToTable([==[MOUNTS]==])
-    local old_draw, old_remove = ENT.Draw, ENT.OnRemove
+	pods = {m["container"] for m in mounts if m.get("container")}
+	if not pods.issubset({m["prefix"] for m in external}):
+		raise ValueError("Rocket containers require independent shell models")
 
-    function ENT:Draw(...)
-        if old_draw then old_draw(self, ...) else self:DrawModel() end
-        self.wtMountedRockets = self.wtMountedRockets or {}
+	clientSetup = ""
+	clientDraw = ""
+	clientCleanup = ""
+	if external:
+		mountsJson = json.dumps([dict({k: m[k] for k in ("prefix", "pos", "model")}, pod=m["prefix"] in pods) for m in external])
+		clientSetup = f"    local MOUNTS = util.JSONToTable( [==[{mountsJson}]==] )"
+		clientDraw = '''        self.wtMountedRockets = self.wtMountedRockets or {}
         self.wtDroppedPods = self.wtDroppedPods or {}
-        for i, mount in ipairs(mounts) do
-            if mount.pod and self:GetNW2Bool(mount.prefix, false) then
+
+        for i, mount in ipairs( MOUNTS ) do
+            if mount.pod and self:GetNW2Bool( mount.prefix, false ) then
                 local model = self.wtMountedRockets[i]
-                if IsValid(model) then
+
+                if IsValid( model ) then
                     self.wtDroppedPods[#self.wtDroppedPods + 1] = {
                         Model = model, Position = model:GetPos(), Angles = model:GetAngles(),
                         Velocity = self:GetVelocity() - self:GetUp() * 40, Time = CurTime()
@@ -130,100 +130,108 @@ if CLIENT then
                     self.wtMountedRockets[i] = nil
                 end
             end
-            if not self:GetNW2Bool(mount.prefix, false) then
+
+            if not self:GetNW2Bool( mount.prefix, false ) then
                 local model = self.wtMountedRockets[i]
-                if not IsValid(model) then
-                    model = ClientsideModel(mount.model, RENDERGROUP_OPAQUE)
-                    if IsValid(model) then model:SetNoDraw(true) end
+
+                if not IsValid( model ) then
+                    model = ClientsideModel( mount.model, RENDERGROUP_OPAQUE )
+                    if IsValid( model ) then model:SetNoDraw( true ) end
                     self.wtMountedRockets[i] = model
                 end
-                if IsValid(model) then
+
+                if IsValid( model ) then
                     local p = mount.pos
-                    model:SetPos(self:LocalToWorld(Vector(p[1], p[2], p[3])))
-                    model:SetAngles(self:GetAngles())
-                    model:SetSkin(self:GetSkin())
+                    model:SetPos( self:LocalToWorld( Vector( p[1], p[2], p[3] ) ) )
+                    model:SetAngles( self:GetAngles() )
+                    model:SetSkin( self:GetSkin() )
                     model:SetupBones()
                     model:DrawModel()
                 end
             end
         end
+
         -- Cosmetic debris: no collision forces or extra server entities on the aircraft.
         for i = #self.wtDroppedPods, 1, -1 do
             local pod = self.wtDroppedPods[i]
             local age = CurTime() - pod.Time
-            if age > 8 or not IsValid(pod.Model) then
-                if IsValid(pod.Model) then pod.Model:Remove() end
-                table.remove(self.wtDroppedPods, i)
+
+            if age > 8 or not IsValid( pod.Model ) then
+                if IsValid( pod.Model ) then pod.Model:Remove() end
+                table.remove( self.wtDroppedPods, i )
             else
-                pod.Model:SetPos(pod.Position + pod.Velocity * age - Vector(0, 0, 0.5 * 9.80665 * 40 * age * age))
-                pod.Model:SetAngles(pod.Angles + Angle(age * 12, 0, age * 8))
+                pod.Model:SetPos( pod.Position + pod.Velocity * age - Vector( 0, 0, 0.5 * 9.80665 * 40 * age * age ) )
+                pod.Model:SetAngles( pod.Angles + Angle( age * 12, 0, age * 8 ) )
                 pod.Model:SetupBones()
                 pod.Model:DrawModel()
             end
+        end'''
+		clientCleanup = '''        for _, pod in ipairs( self.wtDroppedPods or {} ) do
+            if IsValid( pod.Model ) then pod.Model:Remove() end
         end
-    end
 
-    function ENT:OnRemove(...)
-        for _, pod in ipairs(self.wtDroppedPods or {}) do
-            if IsValid(pod.Model) then pod.Model:Remove() end
+        self.wtDroppedPods = nil
+
+        for _, model in pairs( self.wtMountedRockets or {} ) do
+            if IsValid( model ) then model:Remove() end
         end
-        for _, model in pairs(self.wtMountedRockets or {}) do
-            if IsValid(model) then model:Remove() end
-        end
-        if old_remove then return old_remove(self, ...) end
-        return BaseClass.OnRemove(self, ...)
-    end
-end
-'''.replace('MOUNTS', json.dumps([dict({k: m[k] for k in ('prefix', 'pos', 'model')}, pod=m['prefix'] in pods) for m in external]))
-	return '\nENT.WeaponInfo = util.JSONToTable([==[' + weaponInfo + ']==])\n' + visuals + '''
-if SERVER then
-    local missile_groups = util.JSONToTable([==[DATA]==])
-    local reload_times = util.JSONToTable([==[RELOADS]==])
-    local create_features = ENT.CreateFeatures
 
-    function ENT:CreateFeatures()
-        create_features(self)
+        self.wtMountedRockets = nil'''
 
-        for _, weapon in ipairs(self.weapons) do
+	serverSetupParts = []
+	if groups:
+		serverSetupParts.append(f"    local missileGroups = util.JSONToTable( [==[{data}]==] )")
+	if reloadTimes or groups:
+		serverSetupParts.append(f"    local reloadTimes = util.JSONToTable( [==[{json.dumps(reloadTimes)}]==] )")
+	serverSetup = "\n".join(serverSetupParts)
+
+	createFeatureParts = []
+	if groups or reloadTimes:
+		createFeatureParts.append('''        for _, weapon in ipairs( self.weapons ) do
             if weapon.ClassName == "base" or weapon.ClassName == "explosive_cannon" then
-                weapon.ReloadDelay = reload_times.gun or weapon.ReloadDelay
+                weapon.ReloadDelay = reloadTimes.gun or weapon.ReloadDelay
+
                 -- shortcut: preserve sub-tick remainder, but >tick-rate guns need multi-shot scheduling.
-                function weapon:SetNextPrimaryFire(time)
-                    self.nextFire = self.isFiring and math.max(self.nextFire, CurTime() - engine.TickInterval()) + self.FireDelay or time
+                function weapon:SetNextPrimaryFire( time )
+                    self.nextFire = self.isFiring and math.max( self.nextFire, CurTime() - engine.TickInterval() ) + self.FireDelay or time
                 end
             end
-        end
+        end''')
 
-        for _, mounts in ipairs(missile_groups) do
+	if groups:
+		createFeatureParts.append('''        for _, mounts in ipairs( missileGroups ) do
             local definition = mounts[1].weapon.weaponBlk
-            local is_bomb = definition.bomb ~= nil
-            local guided = not is_bomb and (mounts[1].weapon.trigger ~= "rockets" or definition.rocket.guidanceType ~= nil)
-            self:CreateWeapon(guided and "homing_launcher" or "missile_launcher", {
+            local isBomb = definition.bomb ~= nil
+            local guided = not isBomb and ( mounts[1].weapon.trigger ~= "rockets" or definition.rocket.guidanceType ~= nil )
+
+            self:CreateWeapon( guided and "homing_launcher" or "missile_launcher", {
                 MaxAmmo = #mounts,
-                ReloadDelay = reload_times[is_bomb and "bomb" or "missile"] or mounts[1].weapon.arcadeReload,
-                FireDelay = 1 / definition.shotFreq
-            })
+                ReloadDelay = reloadTimes[isBomb and "bomb" or "missile"] or mounts[1].weapon.arcadeReload,
+                FireDelay = 1 / math.max( definition.shotFreq or 1, 0.01 )
+            } )
+
             local weapon = self.weapons[self.weaponCount]
             weapon.WTMounts = mounts
             local reload = weapon.Reload
 
             function weapon:Reload()
-                reload(self)
+                reload( self )
                 self.isReloading = false
                 self.projectileOffsetIndex = 0
 
-                for _, mount in ipairs(self.WTMounts) do
-                    if mount.container then self.Vehicle:SetNW2Bool(mount.container, false) end
+                for _, mount in ipairs( self.WTMounts ) do
+                    if mount.container then self.Vehicle:SetNW2Bool( mount.container, false ) end
+
                     if mount.external then
-                        self.Vehicle:SetNW2Bool(mount.prefix, false)
+                        self.Vehicle:SetNW2Bool( mount.prefix, false )
                     else
-                        self.Vehicle:SetBodygroup(self.Vehicle:FindBodygroupByName(mount.prefix), 0)
+                        self.Vehicle:SetBodygroup( self.Vehicle:FindBodygroupByName( mount.prefix ), 0 )
                     end
                 end
             end
 
             function weapon:Think()
-                if not self.Vehicle:GetInputBool(1, "attack") then
+                if not self.Vehicle:GetInputBool( 1, "attack" ) then
                     self.WTTriggerHeld = false
                 end
             end
@@ -231,6 +239,7 @@ if SERVER then
             function weapon:PrimaryAttack()
                 if self.WTTriggerHeld then return end
                 self.WTTriggerHeld = true
+
                 local vehicle = self.Vehicle
                 local index = self.projectileOffsetIndex + 1
                 local mount = self.WTMounts[index]
@@ -238,70 +247,83 @@ if SERVER then
 
                 local target = guided and vehicle:GetLockOnState() == 2 and vehicle:GetLockOnTarget() or nil
                 local p = mount.pos
-                local pos = vehicle:LocalToWorld(Vector(p[1], p[2], p[3]))
+                local pos = vehicle:LocalToWorld( Vector( p[1], p[2], p[3] ) )
                 local missile
-                if is_bomb then
-                    missile = ents.Create("glide_projectile")
-                    if not IsValid(missile) then return end
-                    missile:SetPos(pos)
-                    missile:SetAngles(vehicle:GetAngles())
+
+                if isBomb then
+                    missile = ents.Create( "glide_projectile" )
+                    if not IsValid( missile ) then return end
+
+                    missile:SetPos( pos )
+                    missile:SetAngles( vehicle:GetAngles() )
                     missile:Spawn()
-                    missile:SetupProjectile(vehicle:GetSeatDriver(1), vehicle)
-                    missile:SetModel(mount.model)
+                    missile:SetupProjectile( vehicle:GetSeatDriver( 1 ), vehicle )
+                    missile:SetModel( mount.model )
                     missile.velocity = vehicle:GetVelocity()
-                    missile:SetProjectileGravity(9.80665 * 40)
+                    missile:SetProjectileGravity( 9.80665 * 40 )
                     missile.lifeTime = CurTime() + 120
+
                     local bomb = definition.bomb
+                    local expMass = bomb.explosiveMass or 10
                     -- shortcut: Glide blast damage is an approximation, not WT fragment/penetration simulation.
-                    missile.damage = math.max(250, bomb.explosiveMass * 10)
-                    missile.radius = math.min(4000, 100 * bomb.explosiveMass ^ (1 / 3))
+                    missile.damage = math.max( 250, expMass * 10 )
+                    missile.radius = math.min( 4000, 100 * expMass ^ ( 1 / 3 ) )
+
                     local phys = missile:GetPhysicsObject()
-                    if IsValid(phys) then phys:SetMass(bomb.mass) end
+                    if IsValid( phys ) then phys:SetMass( bomb.mass ) end
                 else
-                    missile = vehicle:FireMissile(pos, vehicle:GetAngles(), vehicle:GetSeatDriver(1), target)
-                    if not IsValid(missile) then return end
-                    missile:SetModel(mount.model)
+                    missile = vehicle:FireMissile( pos, vehicle:GetAngles(), vehicle:GetSeatDriver( 1 ), target )
+                    if not IsValid( missile ) then return end
+
+                    missile:SetModel( mount.model )
                     local rocket = mount.weapon.weaponBlk.rocket
                     -- Unguided WT rockets may specify range instead of a lifetime.
-                    local lifetime = rocket.timeLife or rocket.maxDistance * 40 / math.min(4000, rocket.endSpeed * 40)
+                    local lifetime = rocket.timeLife or rocket.maxDistance * 40 / math.min( 4000, rocket.endSpeed * 40 )
                     missile.lifeTime = CurTime() + lifetime
                     -- shortcut: Glide physics caps speed and approximates WT propulsion/guidance; not a WT flight solver.
-                    missile.maxSpeed = math.min(4000, rocket.endSpeed * 40)
+                    missile.maxSpeed = math.min( 4000, rocket.endSpeed * 40 )
                     missile.acceleration = rocket.force / rocket.mass * 40
-                    missile.speed = math.max(rocket.startSpeed * 40, vehicle:GetVelocity():Dot(vehicle:GetForward()))
+                    missile.speed = math.max( rocket.startSpeed * 40, vehicle:GetVelocity():Dot( vehicle:GetForward() ) )
+
                     local phys = missile:GetPhysicsObject()
-                    if IsValid(phys) then phys:SetMass(rocket.mass) end
+                    if IsValid( phys ) then phys:SetMass( rocket.mass ) end
                 end
 
-                self:TakePrimaryAmmo(1)
-                self:SetNextPrimaryFire(CurTime() + self.FireDelay)
+                self:TakePrimaryAmmo( 1 )
+                self:SetNextPrimaryFire( CurTime() + self.FireDelay )
                 self.projectileOffsetIndex = index
+
                 if mount.external then
-                    vehicle:SetNW2Bool(mount.prefix, true)
+                    vehicle:SetNW2Bool( mount.prefix, true )
                 else
-                    vehicle:SetBodygroup(vehicle:FindBodygroupByName(mount.prefix), 1)
+                    vehicle:SetBodygroup( vehicle:FindBodygroupByName( mount.prefix ), 1 )
                 end
+
                 if mount.container then
                     local empty = true
-                    for _, group in ipairs(missile_groups) do
-                        for _, round in ipairs(group) do
-                            if round.container == mount.container and not vehicle:GetNW2Bool(round.prefix, false) then
+
+                    for _, group in ipairs( missileGroups ) do
+                        for _, round in ipairs( group ) do
+                            if round.container == mount.container and not vehicle:GetNW2Bool( round.prefix, false ) then
                                 empty = false
                             end
                         end
                     end
-                    if empty then vehicle:SetNW2Bool(mount.container, true) end
+
+                    if empty then vehicle:SetNW2Bool( mount.container, true ) end
                 end
             end
-        end
-    end
+        end''')
 
-    -- Glide only thinks the active weapon; finish holstered reloads as well.
-    function ENT:WeaponThink(self_table)
-        for index, weapon in ipairs(self.weapons) do
-            if weapon.WTMounts and not self:GetInputBool(1, "attack") then
+	serverCreateFeatures = "\n\n".join(createFeatureParts)
+
+	serverWeaponThink = '''    -- Glide only thinks the active weapon; finish holstered reloads as well.
+    function ENT:WeaponThink( selfTbl )
+        for index, weapon in ipairs( self.weapons ) do
+            if weapon.WTMounts and not self:GetInputBool( 1, "attack" ) then
                 weapon.WTTriggerHeld = false
             end
+
             if index ~= self.weaponState.index and weapon.MaxAmmo > 0 and weapon.ammo == 0 and CurTime() > weapon.nextReload then
                 weapon:Reload()
                 weapon.isReloading = false
@@ -309,7 +331,15 @@ if SERVER then
             end
         end
 
-        BaseClass.WeaponThink(self, self_table)
-    end
-end
-'''.replace("RELOADS", json.dumps(reloadTimes)).replace("DATA", data)
+        BaseClass.WeaponThink( self, selfTbl )
+    end''' if (groups or guns) else ""
+
+	return {
+		"weaponInfo": f"ENT.WeaponInfo = util.JSONToTable( [==[{weaponInfo}]==] )" if info else "",
+		"clientSetup": clientSetup,
+		"clientDraw": clientDraw,
+		"clientCleanup": clientCleanup,
+		"serverSetup": serverSetup,
+		"serverCreateFeatures": serverCreateFeatures,
+		"serverWeaponThink": serverWeaponThink,
+	}

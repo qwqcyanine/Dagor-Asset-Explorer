@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "dae"))
 from parse.realres import Model, SMD, bindNode
-from util.glide import TRACK_R_SUFFIX, defaultOptions, gearbox, generateLua, glideCollisionNodes, splitTrackMaterials
+from util.glide import TRACK_R_SUFFIX, defaultOptions, gearbox, generateLua, glideCollisionNodes, splitTrackMaterials, turretLimits
 
 
 def track(mdl:Model, name:str, mat:str, vPerMeter:float):
@@ -48,6 +48,8 @@ class GlideTest(unittest.TestCase):
             "VehiclePhys": {"Mass": {"TakeOff": 46000.0}, "mechanics": {"steerType": "differential"}}}
         self.assertEqual(defaultOptions(blk), {"singleFlow": False, "mass": 46000.0, "maxFwdSpeed": 75.0, "maxRevSpeed": 10.0, "upgraded": True, "wheeled": False})
         self.assertTrue(defaultOptions(None)["singleFlow"])
+        self.assertFalse(defaultOptions({"VehiclePhys": {"mechanics": {"steerType": "clutch_braking", "neutralGearRatio": 2.1}}})["singleFlow"])
+        self.assertTrue(defaultOptions({"VehiclePhys": {"mechanics": {"steerType": "clutch_braking"}}})["singleFlow"])
 
     def test_wheels_lifted_by_suspension_travel(self):
         class Node:
@@ -59,9 +61,10 @@ class GlideTest(unittest.TestCase):
             def getNodeByName(self, name): return None
             def getNodes(self): return self.nodes
         lua = generateLua("wt_x", "x", "models/wt_glide/x.mdl", Skeleton(), None, options = {"mass": 40000, "singleFlow": False})
-        # wheels at 16 units: mounts sit the bump travel (10) higher; springs carry the weight with 2 units of sag
-        self.assertIn("CreateWheel( Vector( 80.0, 56.0, 26.0 )", lua)
-        self.assertIn("SetSpringStrength( 30000 )", lua) # 40000 kg * 9 / (6 wheels * 2 units)
+        # wheels at 16 units: mounts sit the bump travel (9) higher; springs carry the weight with 5 units of sag
+        self.assertIn("CreateWheel( Vector( 80.0, 56.0, 25.0 )", lua)
+        self.assertIn("SetSuspensionLength( 14.0 )", lua)
+        self.assertIn("SetSpringStrength( 12000 )", lua) # 40000 kg * 9 / (6 wheels * 5 units)
         self.assertIn("ENT.WTSingleFlow = false", lua)
 
     def test_wheeled_vehicle_steers_its_axles(self):
@@ -159,6 +162,72 @@ class GlideTest(unittest.TestCase):
         self.assertTrue(lines[2].endswith(" 2 1 0.250000 3 0.750000"))
         self.assertEqual(len(lines[3].split()), 9)
         self.assertTrue(lines[4].endswith(" 1 2 1.000000"))
+
+    def test_turret_limits_table_and_tilt_and_yaw_clamp(self):
+        from math import sin, cos, radians
+        blk = {"commonWeapons": {"Weapon": [{
+            "limits": {"yaw": (-180.0, 180.0), "pitch": (-5.0, 13.0)},
+            "limitsTable": {
+                "lim1": (-180.0, -135.0, -1.5, 13.0),
+                "lim2": [(-135.0, -120.0, -2.5, 13.0), (-120.0, 125.0, -5.0, 13.0)],
+                "lim3": (125.0, 180.0, -1.5, 13.0),
+            },
+        }]}}
+        _, _, _, _, table = turretLimits(blk["commonWeapons"]["Weapon"][0])
+        self.assertEqual(len(table), 4)
+        self.assertEqual(table[0], (-180.0, -135.0, -1.5, 13.0))
+
+        rad = radians(1.66)
+        class Node:
+            def __init__(self, name):
+                self.name, self.children, self.parent = name, [], None
+                self.wtm = [[cos(rad), sin(rad), 0, 0], [-sin(rad), cos(rad), 0, 1.5], [0, 0, -1, 0]]
+        nodes = [Node("bone_turret"), Node("bone_gun")]
+        class Skeleton:
+            def getNodeByName(self, name): return next((n for n in nodes if n.name == name), None)
+            def getNodes(self): return nodes
+        lua = generateLua("wt_x", "x", "models/wt_glide/x.mdl", Skeleton(), blk)
+        self.assertIn("1.660 * math.cos( math.rad( wtYaw ) )", lua)
+        self.assertIn("if wtYaw >= lim[1] and wtYaw <= lim[2] then", lua)
+        self.assertIn("gunPitch[1] = turretAng[1] - 1.660 * math.cos( math.rad( turretAng[2] ) )", lua)
+        self.assertIn("ang[2] = -( turretAng[1] - 1.660 * math.cos( math.rad( turretAng[2] ) ) )", lua)
+        self.assertIn("BoneTurretAngles( turretAng[2] )", lua)
+        self.assertIn("TurretAngles( turretAng[2] )", lua)
+        self.assertIn("self:SetRenderBounds( mins, maxs )", lua)
+        self.assertIn("self:MarkShadowAsDirty()", lua)
+
+        casemate = {"commonWeapons": {"Weapon": [{"limits": {"yaw": (-3.0, 7.0), "pitch": (-3.0, 22.0)}}]}}
+        lua_cm = generateLua("wt_cm", "cm", "models/wt_glide/cm.mdl", Skeleton(), casemate)
+        self.assertIn("local yawMin, yawMax = -7.0, 3.0", lua_cm)
+
+    def test_tracked_uses_middle_wheel_and_caps_forward_traction(self):
+        class Node:
+            def __init__(self, name, x, y, z):
+                self.name, self.children, self.parent = name, [], None
+                self.wtm = [[1, 0, 0, x], [0, 1, 0, y], [0, 0, 1, z]]
+        nodes = [Node(f"bone_wheel_{s}_0{i}", x, 0.4, z) for s, z in (("l", 1.4), ("r", -1.4)) for i, x in enumerate((2, 0, -2))]
+        class Skeleton:
+            def getNodeByName(self, name): return next((n for n in nodes if n.name == name), None)
+            def getNodes(self): return nodes
+        lua = generateLua("wt_x", "x", "models/wt_glide/x.mdl", Skeleton(), None,
+                          {"l": (["m"], 0.05), "r": (["m_r"], 0.05)}, options = {"mass": 40000})
+        # middle unsteered road wheels (2 and 5), not steered corner wheels (1 and 4)
+        self.assertIn('{ wheel = 2, scale =', lua)
+        self.assertIn('{ wheel = 5, scale =', lua)
+        self.assertIn('{ spin = "bone_wheel_l_01", steer = "bone_wheel_l_01", wheel = 2, angle = 0.0 }', lua)
+        self.assertIn('{ spin = "bone_wheel_r_01", steer = "bone_wheel_r_01", wheel = 5, angle = 0.0 }', lua)
+        # 40000 kg -> massScale 2.0, 6 wheels -> perWheel 1.0 -> 16000 * 2.0 * 1.0 = 32000 (~0.53g)
+        self.assertIn("SetForwardTractionMax( 32000 )", lua)
+        self.assertIn("if w:GetRPM() < -maxRPM then w:SetRPM( -maxRPM ) end", lua)
+        self.assertIn("w.state.traceData.mins = Vector( -s, -s, 0 )", lua)
+        self.assertIn("function ENT:EngineThink( dt, selfTbl )", lua)
+        self.assertIn("function ENT:UpdateSteering( dt, selfTbl )", lua)
+
+        six = [Node(f"bone_wheel_{s}_{i:02d}", x, 0.4, z) for s, z in (("l", 1.4), ("r", -1.4)) for i, x in enumerate((3, 2, 1, 0, -1, -2), 1)]
+        six_lua = generateLua("wt_x6", "x6", "models/wt_glide/x6.mdl",
+            type("S", (), {"getNodeByName": lambda self, n: None, "getNodes": lambda self: six})(), None)
+        self.assertEqual(six_lua.count("steerMultiplier = 0.5 } ):SetSoundsEnabled( false )"), 2)
+        self.assertEqual(six_lua.count("steerMultiplier = -0.5 } ):SetSoundsEnabled( false )"), 2)
 
 
 class WTSoundTest(unittest.TestCase):
@@ -463,6 +532,16 @@ class AircraftTest(unittest.TestCase):
         self.assertNotIn('ENT.RotorBeatInterval = 0', fallback)
         self.assertNotIn('function ENT:OnUpdateSounds()', fallback)
 
+    def test_aircraft_countermeasures_respect_wt_weapon_slots(self):
+        from types import SimpleNamespace
+        from util.glide import generateAircraftLua
+        node = SimpleNamespace(name="root", wtm=[[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+        skeleton = SimpleNamespace(getNodes=lambda: [node], getNodeByName=lambda n: node if n == "root" else None)
+        ww2 = {"fm": {}, "WeaponSlots": {"WeaponSlot": [{"index": 0, "WeaponPreset": {"Weapon": [{"trigger": "bombs"}]}}]}}
+        jet = {"fm": {}, "WeaponSlots": {"WeaponSlot": [{"index": 0, "WeaponPreset": {"Weapon": [{"trigger": "countermeasures", "bullets": 48}]}}]}}
+        self.assertIn("ENT.CountermeasureCount = 0", generateAircraftLua("wt_p51", "p51", "models/p51.mdl", skeleton, ww2))
+        self.assertNotIn("ENT.CountermeasureCount = 0", generateAircraftLua("wt_su33", "su33", "models/su33.mdl", skeleton, jet))
+
     def test_heli_cannon_prefix_does_not_select_generic_samples(self):
         import tempfile
         import numpy as np
@@ -649,3 +728,139 @@ class AircraftTest(unittest.TestCase):
         self.assertEqual(bf["fm"]["Mass"]["EmptyMass"], 1900.0)
         self.assertEqual(ef["fm"]["Mass"]["EmptyMass"], 11000.0)
         self.assertEqual(defaultOptions(bf), {"aircraft": True, "helicopter": False, "mass": 2077.0, "maxSpeed": 2400.0, "engineForce": 350.0})
+
+
+class TankSmokeTest(unittest.TestCase):
+    def test_tank_smoke_weapon_filters_barrels_and_finds_ejection_launchers(self):
+        from types import SimpleNamespace
+        from util.glide import tankSmokeWeapon, findTankSmoke
+        barrel = {
+            "triggerGroup": "smoke",
+            "emitter": "emtr_smoke_01",
+            "weaponBlk": {"mesh": "t55_smoke_barrel", "rocket": {"bulletType": "smoke_grenade_tank", "startSpeed": 1.0}},
+        }
+        grenade = {
+            "triggerGroup": "smoke",
+            "emitterGenRange": (1, 2),
+            "emitterGenFmt": "emtr_mortar_flame_%02d",
+            "salvo": 2,
+            "salvoDelay": 0.5,
+            "weaponBlk": {
+                "mesh": "grenade_cn_76mm",
+                "reloadTime": 8.0,
+                "rocket": {"bulletType": "smoke_grenade_tank", "startSpeed": 16.0, "endSpeed": 16.0,
+                           "smokeActivateTime": 2.0, "smokeTime": 20.0, "smokeShellRad": 9.0},
+            },
+        }
+        blk = {
+            "commonWeapons": {"Weapon": [barrel]},
+            "modifications": {"tank_smoke_screen_system_mod": {"effects": {"commonWeapons": {"Weapon": [grenade]}}}},
+        }
+        self.assertIsNone(tankSmokeWeapon(blk, upgraded=False))
+        self.assertIs(tankSmokeWeapon(blk, upgraded=True), grenade)
+
+        class Node:
+            def __init__(self, idx, name, parent, pos, xAxis=(1.0, 0.0, 0.0)):
+                self.idx, self.name, self.parent = idx, name, parent
+                self.wtm = [[xAxis[0], 0, 0, pos[0]], [xAxis[1], 1, 0, pos[1]], [xAxis[2], 0, 1, pos[2]], [0, 0, 0, 1]]
+
+        root = Node(0, "", None, (0, 0, 0))
+        turret = Node(1, "bone_turret", root, (0.2, 1.5, 0.0))
+        mount = Node(2, "bone_grenade", turret, (0.2, 1.5, 0.0))
+        e1 = Node(3, "emtr_mortar_flame_01", mount, (0.2, 1.8, -1.5), (0.8, 0.6, 0.0))
+        e2 = Node(4, "emtr_mortar_flame_02", mount, (0.2, 1.8, 1.5), (0.8, 0.6, 0.0))
+        nodes = [root, turret, mount, e1, e2]
+        skeleton = SimpleNamespace(getNodes=lambda: nodes, getNodeByName=lambda n: next((x for x in nodes if x.name == n), None))
+        smoke = findTankSmoke(blk, skeleton)
+        self.assertEqual(smoke["mesh"], "grenade_cn_76mm")
+        self.assertEqual(len(smoke["emitters"]), 2)
+        self.assertTrue(all(e["turret"] and e["bone"] == "bone_turret" for e in smoke["emitters"]))
+        self.assertAlmostEqual(smoke["emitters"][0]["pos"][2], 12.0)
+        self.assertAlmostEqual(smoke["speed"], 640.0)
+        self.assertAlmostEqual(smoke["smokeRadius"], 360.0)
+
+    def test_compile_smoke_models_and_generate_lua(self):
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from util.glide import compileSmokeModels, generateLua
+
+        class Node:
+            def __init__(self, idx, name, parent, pos):
+                self.idx, self.name, self.parent = idx, name, parent
+                self.wtm = [[1, 0, 0, pos[0]], [0, 1, 0, pos[1]], [0, 0, 1, pos[2]], [0, 0, 0, 1]]
+
+        root = Node(0, "", None, (0, 0, 0))
+        turret = Node(1, "bone_turret", root, (0, 1, 0))
+        emtr1 = Node(2, "emtr_mortar_flame_01", turret, (1, 2, 0.5))
+        emtr2 = Node(3, "emtr_mortar_flame_02", turret, (1, 2, -0.5))
+        nodes = [root, turret, emtr1, emtr2]
+
+        class Skeleton:
+            def getNodes(self): return nodes
+            def getNodeByName(self, name): return next((n for n in nodes if n.name == name), None)
+            def getReducedBones(self, keep):
+                kept = [n for n in nodes if n.idx == 0 or n.name in keep]
+                bmap = {n.idx: (kept.index(n) if n in kept else 0) for n in nodes}
+                return kept, bmap
+            def getReducedSMD(self, kept):
+                return "nodes\n" + "\n".join(f'{i} "{n.name or "_ROOT"}" {0 if i else -1}' for i, n in enumerate(kept)) + "\nend\nskeleton\ntime 0\n0 0 0 0 0 0 0\nend"
+
+        class Mat:
+            def __init__(self, name): self._name = name
+            def getName(self): return self._name
+            def setName(self, name): self._name = name
+
+        grenade = Model("grenade_cn_76mm", materials=(Mat("grenade_mat"),))
+        gObj = grenade.newObject("@root")
+        gObj.appendMaterial("grenade_mat")
+        grenade.appendVerts([(0, 0, 0), (0.2, 0, 0), (0, 0.1, 0)], [(0, 0), (1, 0), (0, 1)], scale=False)
+        gObj.appendFace((0, 1, 2))
+
+        smoke = {
+            "mesh": "grenade_cn_76mm",
+            "grenadeModel": grenade,
+            "matMap": {"grenade_mat": "smoke_grenade_mat"},
+            "emitters": [
+                {"name": "emtr_mortar_flame_01", "bone": "bone_turret", "turret": True, "pos": [40.0, 20.0, 40.0], "dir": (0.8, 0.0, 0.6)},
+                {"name": "emtr_mortar_flame_02", "bone": "bone_turret", "turret": True, "pos": [40.0, -20.0, 40.0], "dir": (0.8, 0.0, 0.6)},
+            ],
+            "salvo": 2,
+            "salvoDelay": 0.5,
+            "reloadTime": 8.0,
+            "speed": 640.0,
+            "activateTime": 2.0,
+            "smokeTime": 20.0,
+            "smokeRadius": 360.0,
+        }
+
+        with tempfile.TemporaryDirectory() as d:
+            qc = Path(d) / "ztz_99a.qc"
+            qc.write_text('$modelname "wt_glide/ztz_99a.mdl"\n$cdmaterials "models/wt_glide/ztz_99a"\n')
+            targets = compileSmokeModels(qc, Skeleton(), smoke)
+            self.assertEqual([name for _, name in targets], ["ztz_99a_smoke", "ztz_99a_smoke_rack"])
+            self.assertEqual(smoke["projModel"], "models/wt_glide/ztz_99a_smoke.mdl")
+            self.assertEqual(smoke["rackModel"], "models/wt_glide/ztz_99a_smoke_rack.mdl")
+            self.assertEqual(smoke["bodygroups"], [(0, 1), (1, 2)])
+            rackQcText = (Path(d) / "ztz_99a_smoke_rack.qc").read_text()
+            self.assertIn('$bodygroup "smoke_00"', rackQcText)
+            self.assertIn('$bodygroup "smoke_01"', rackQcText)
+            self.assertIn("smoke_grenade_mat", (Path(d) / "ztz_99a_smoke.smd").read_text())
+            self.assertIn("smoke_grenade_mat", (Path(d) / "ztz_99a_smoke_rack_00.smd").read_text())
+
+        lua = generateLua("wt_ztz_99a", "ZTZ-99A", "models/wt_glide/ztz_99a.mdl", Skeleton(), None, smoke=smoke)
+        self.assertIn('name = "Smoke Grenades"', lua)
+        self.assertIn("self.wtSmokeRack = ClientsideModel( SMOKE.rackModel", lua)
+        self.assertIn("EF_BONEMERGE", lua)
+        self.assertIn("FireSmoke", lua)
+        self.assertIn('net.Receive( "WTGlide.SmokeBurst"', lua)
+        self.assertIn('self:SetNW2Int( "WTSmokeFired", 0 )', lua)
+        self.assertIn("self.wtSmokeRack:Remove()", lua)
+        self.assertIn('weapon.CrosshairImage = ""', lua)
+        self.assertIn("function ENT:WeaponThink( selfTbl )", lua)
+        self.assertIn("if not fullUpdate and IsValid( self.wtSmokeRack ) then", lua)
+        self.assertIn("smokeBurstId = smokeBurstId + 1", lua)
+
+        plainLua = generateLua("wt_plain", "Plain", "models/wt_glide/plain.mdl", Skeleton(), None)
+        self.assertNotIn("function ENT:OnActivateWeapon", plainLua)
+        self.assertNotIn("function ENT:WeaponThink", plainLua)

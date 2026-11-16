@@ -291,7 +291,7 @@ class AuditFixesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, \
              patch("util.glide.generateAircraftLua", return_value="AIRFRAME\n"), \
              patch("util.glide.aircraftGuns", return_value=[]), \
-             patch("util.wtweapons.missileLua", return_value="WEAPONS\n") as missile_mock, \
+             patch("util.wtweapons.aircraftWeaponBlocks", return_value={}) as missile_mock, \
              patch("util.wtloadout.weaponLabels", side_effect=AssertionError("should not reload labels")):
             writeAddon(folder, "wt_test", "Test", "models/wt_glide/test.mdl", None,
                        {"fm": {}}, labels={"weapons/r73": "R-73"})

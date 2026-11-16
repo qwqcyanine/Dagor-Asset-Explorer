@@ -1,7 +1,7 @@
 """Generate a Glide (gmod-glide, base_glide_tank) addon around a compiled War Thunder tank model."""
 import json
 import re
-from math import pi, sqrt, isfinite
+from math import pi, sqrt, isfinite, atan2, degrees, hypot
 from os import path, makedirs
 from statistics import median
 import util.log as log
@@ -23,15 +23,15 @@ GLIDE_KEEP_BONES = {
 TRACK_R_SUFFIX = "_r"
 GLIDE_KMH = 0.06858 # Glide's speedometer: km/h per unit/s
 GLIDE_WEIGHT = 9.0 # Glide spring force per kg of mass at rest (sv_gravity 600 * 0.015 tick), measured in game
-# stiff tank suspension: springs sag only REST_COMPRESSION under the hull's weight (so wheels barely droop and
-# the hull rides up onto obstacles) and wheels can rise BUMP_TRAVEL above rest
-REST_COMPRESSION = 2.0
+# stiff tank suspension: springs sag REST_COMPRESSION under the hull's weight (enough droop to follow bumps
+# without leaving half the track airborne) and wheels can rise BUMP_TRAVEL above rest
+REST_COMPRESSION = 5.0
 # track rolling resistance (fraction of weight) on hard ground at top speed; Glide's is car tyre sized, ~0.1% for a tank
 TRACK_ROLLING = 0.05
 # Glide applies the front/rear power split twice (share / wheel count * share of torque): with PowerDistribution 0
 # the wheels get 0.5 * 0.5 + 0.5 * 0.5 of the engine output, measured in game
 GLIDE_POWER_SPLIT = 0.5
-BUMP_TRAVEL = 10.0
+BUMP_TRAVEL = 9.0
 
 def defaultOptions(blk:dict):
 	"""Export options the user can edit, prefilled from the War Thunder vehicle blk."""
@@ -48,10 +48,13 @@ def defaultOptions(blk:dict):
 
 	blk = blk or {}
 	phys = blk.get("VehiclePhys", {})
+	mech = phys.get("mechanics") or {}
 	mass = phys.get("Mass", {}).get("TakeOff", blk.get("mass", 20000))
 
 	return {
-		"singleFlow": phys.get("mechanics", {}).get("steerType", "clutch_braking") == "clutch_braking",
+		# WT tanks with neutralGearRatio (e.g. ZTZ-99A, Leopard 2, Abrams) have dual-flow neutral counter-rotation;
+		# older clutch_braking / side_final_drive tanks without it pivot around the braked inner track
+		"singleFlow": mech.get("neutralGearRatio") is None and mech.get("steerType", "clutch_braking") not in ("differential", "double_differential"),
 		"mass": min(float(mass), 50000), # GMod clamps physics mass to 50000
 		"maxFwdSpeed": float(blk.get("maxFwdSpeed", 60)),
 		"maxRevSpeed": float(blk.get("maxRevSpeed", 15)),
@@ -188,7 +191,7 @@ def findTankBlk(assetPath:str, modelName:str):
 			blk = vfs.readBlk(f)
 
 			if str(blk.get("model", "")).lower() == low:
-				for w in weapons(blk):
+				for w in tankAllWeapons(blk):
 					try:
 						w["weaponBlk"] = vfs.readBlk(str(w.get("blk", "")).lower())
 					except Exception:
@@ -209,6 +212,246 @@ def weapons(blk:dict):
 	w = (blk or {}).get("commonWeapons", {}).get("Weapon")
 
 	return [x for x in (w if isinstance(w, list) else [w]) if isinstance(x, dict)]
+
+def tankAllWeapons(blk:dict, upgraded:bool = True):
+	"""Base weapons plus modification-provided weapons (such as smoke grenade launchers)."""
+	out = list(weapons(blk))
+	if upgraded:
+		for mod in ((blk or {}).get("modifications") or {}).values():
+			if isinstance(mod, dict):
+				mw = ((mod.get("effects") or {}).get("commonWeapons") or {}).get("Weapon")
+				out.extend(x for x in (mw if isinstance(mw, list) else [mw]) if isinstance(x, dict))
+	return out
+
+def tankSmokeWeapon(blk:dict, upgraded:bool = True):
+	"""First ejection-type smoke grenade launcher (excludes rear drop-off smoke barrels/candles)."""
+	for w in tankAllWeapons(blk, upgraded):
+		if w.get("triggerGroup") != "smoke":
+			continue
+		wb = w.get("weaponBlk") or {}
+		rocket = wb.get("rocket") or {}
+		mesh = wb.get("mesh")
+		if rocket.get("bulletType") != "smoke_grenade_tank" or not isinstance(mesh, str) or not mesh:
+			continue
+		if "smoke_barrel" in mesh or mesh == "smoke_generator_no8":
+			continue
+		if float(rocket.get("startSpeed", 0) or 0) < 5.0:
+			continue
+		return w
+	return None
+
+def findTankSmoke(blk:dict, skeleton, upgraded:bool = True):
+	"""Resolve ejection smoke grenade launcher geometry, emitters and flight/smoke parameters."""
+	w = tankSmokeWeapon(blk, upgraded)
+	if w is None or skeleton is None:
+		return None
+	bounds, fmt = w.get("emitterGenRange"), w.get("emitterGenFmt")
+	if isinstance(bounds, (list, tuple)) and len(bounds) == 2 and isinstance(fmt, str):
+		names = [fmt % i for i in range(int(bounds[0]), int(bounds[1]) + 1)]
+	elif isinstance(w.get("emitter"), str):
+		names = [w["emitter"]]
+	else:
+		return None
+	nodes = [n for name in names if (n := skeleton.getNodeByName(name)) is not None]
+	if not nodes:
+		return None
+
+	turret = skeleton.getNodeByName("bone_turret")
+	turretPos = gamePos(turret) if turret is not None else (0.0, 0.0, 0.0)
+	emitters = []
+	for emtr in nodes:
+		bone = emtr.parent
+		while bone is not None and bone.name not in GLIDE_KEEP_BONES:
+			bone = bone.parent
+		boneName = bone.name if bone is not None and bone.name in GLIDE_KEEP_BONES else "_ROOT"
+		isTurret = boneName == "bone_turret"
+		pos = gamePos(emtr)
+		if isTurret:
+			pos = [a - b for a, b in zip(pos, turretPos)]
+		dx, dy, dz = emtr.wtm[0][0], emtr.wtm[2][0], emtr.wtm[1][0]
+		norm = sqrt(dx * dx + dy * dy + dz * dz) or 1.0
+		emitters.append({
+			"name": emtr.name,
+			"bone": boneName,
+			"turret": isTurret,
+			"pos": pos,
+			"dir": (dx / norm, dy / norm, dz / norm),
+		})
+
+	wb = w["weaponBlk"]
+	rocket = wb["rocket"]
+	return {
+		"weapon": w,
+		"mesh": wb["mesh"],
+		"emitters": emitters,
+		"salvo": max(1, int(w.get("salvo", 2) or 2)),
+		"salvoDelay": max(0.1, float(w.get("salvoDelay", 0.5) or 0.5)),
+		"reloadTime": max(1.0, float(wb.get("reloadTime", 8.0) or 8.0)),
+		"speed": max(float(rocket.get("startSpeed", 12.0)), float(rocket.get("endSpeed", 12.0))) * VERTEX_SCALE,
+		"activateTime": max(0.2, float(rocket.get("smokeActivateTime", 2.0) or 2.0)),
+		"smokeTime": max(2.0, float(rocket.get("smokeTime", 20.0) or 20.0)),
+		"smokeRadius": max(40.0, float(rocket.get("smokeShellRad", 9.0) or 9.0) * VERTEX_SCALE),
+	}
+
+def loadSmokeGrenade(gameRoot:str, meshName:str):
+	"""Load a WT smoke grenade DynModel from tanks.grp (fallback: any res/*.grp) and cache its textures."""
+	from pathlib import Path
+	from parse.gameres import GameResourcePack, GameResDesc
+	from parse.material import DDSx, DDSxTexturePack2, MaterialData
+	from parse.realres import DynModel, GeomNodeTree
+	from util.assetcacher import AssetCacher
+
+	res = Path(gameRoot) / "content/base/res"
+	desc = GameResDesc(str(res / "dynModelDesc.bin"))
+	desc.loadDataBlock()
+	AssetCacher.appendGameResDesc(desc)
+
+	model = None
+	packs = [res / "tanks/tanks.grp"] + sorted(p for p in res.rglob("*.grp") if p != res / "tanks/tanks.grp")
+	for grpPath in packs:
+		if not grpPath.is_file():
+			continue
+		pack = GameResourcePack(str(grpPath))
+		assets = pack.getPackedFiles()
+		wanted = next((a for a in assets if isinstance(a, DynModel) and a.name == meshName), None)
+		if wanted is None:
+			continue
+		for asset in assets:
+			if isinstance(asset, GeomNodeTree):
+				AssetCacher.cacheAsset(asset)
+		model = wanted.getModel(0)
+		break
+	if model is None:
+		raise ValueError(f"Missing WT smoke grenade model: {meshName}")
+
+	textures = {t for mat in (model.materials or ()) for t in mat.textures}
+	missing = {MaterialData.getTexFileName(t) for t in textures if not AssetCacher.getCachedAsset(DDSx, MaterialData.getTexFileName(t))}
+	gmPack = res / "tanks/gm.dxp.bin"
+	if missing and gmPack.is_file():
+		for tex in DDSxTexturePack2(str(gmPack)).getPackedFiles():
+			if tex.name in missing:
+				AssetCacher.cacheAsset(tex)
+				missing.remove(tex.name)
+	if missing:
+		from util.wtloadout import cacheTextures
+		cacheTextures(gameRoot, [model])
+	else:
+		cacheHQTextures(gameRoot, textures)
+	return model
+
+def prepareTankSmoke(blk:dict, model, gameRoot:str, upgraded:bool = True):
+	"""Prepare smoke launcher metadata and attach grenade materials to `model` for VMT/VTF export."""
+	from copy import deepcopy
+	if not gameRoot:
+		return None
+	smoke = findTankSmoke(blk, getattr(model, "skeleton", None), upgraded)
+	if smoke is None:
+		return None
+	grenadeModel = loadSmokeGrenade(gameRoot, smoke["mesh"])
+	matMap = {}
+	clonedMats = []
+	for mat in (grenadeModel.materials or ()):
+		m = deepcopy(mat)
+		old = m.getName()
+		new = f"smoke_{old}" if not old.startswith("smoke_") else old
+		m.setName(new)
+		matMap[old] = new
+		clonedMats.append(m)
+	model.appendMaterials(clonedMats)
+	smoke["grenadeModel"] = grenadeModel
+	smoke["matMap"] = matMap
+	return smoke
+
+def compileSmokeModels(qcPath, skeleton, smoke:dict):
+	"""Generate projectile (<stem>_smoke.qc) and bonemerged rack (<stem>_smoke_rack.qc) targets."""
+	from pathlib import Path
+	from parse.realres import Model
+	from util.wtloadout import mountedModel
+
+	qcPath = Path(qcPath)
+	qcText = qcPath.read_text()
+	modelMatch = re.search(r'\$modelname\s+"([^"]+)\.mdl"', qcText)
+	cdMatMatch = re.search(r'^\$cdmaterials\s+.+$', qcText, re.M)
+	if not modelMatch or not cdMatMatch:
+		raise ValueError(f"Invalid tank QC for smoke compilation: {qcPath}")
+
+	baseModel = modelMatch[1]
+	cdMat = cdMatMatch[0]
+	stem = qcPath.stem
+	grenade = smoke["grenadeModel"]
+	matMap = smoke.get("matMap", {})
+
+	# 1. Single flying projectile model (+X forward, origin at base)
+	projName = f"{stem}_smoke"
+	projModel = Model(projName)
+	for o in grenade:
+		b = grenade.skeleton.getNodeByName(o.name) if grenade.skeleton and not o.skinned else None
+		obj = projModel.newObject(o.name)
+		for start, mat in o.materials.items():
+			obj.appendMaterial(matMap.get(mat, mat), start)
+		idxMap = {}
+		for face in o.faces:
+			for v in face:
+				if v not in idxMap:
+					idxMap[v] = projModel.vertCnt
+					projModel.appendVerts([grenade.getVertex(v, scale = False, parentBone = b)], [grenade.getUV(v)], scale = False)
+			obj.appendFace(tuple(idxMap[v] for v in face))
+	projSmdText = "version 1\nnodes\n0 \"root\" -1\nend\nskeleton\ntime 0\n0 0 0 0 0 0 0\nend\n" + "\n".join(s.getString() for s in projModel.getSMD(dontSplit = True))
+	(qcPath.parent / f"{projName}.smd").write_text(projSmdText)
+	projQC = qcPath.parent / f"{projName}.qc"
+	projQC.write_text(
+		f'$upaxis Y\n$origin 0 0 0 -90\n$modelname "{baseModel}_smoke.mdl"\n{cdMat}\n'
+		f'$body studio "{projName}.smd"\n$sequence idle "{projName}.smd"\n'
+		f'$collisionmodel "{projName}.smd"\n{{\n\t$mass 6.5\n}}\n'
+	)
+
+	# 2. Bonemerged launcher rack model (shares kept ancestor bones e.g. _ROOT / bone_turret)
+	rackName = f"{stem}_smoke_rack"
+	rackKeep = {e["bone"] for e in smoke["emitters"] if e["bone"] != "_ROOT"}
+	rackKept, rackMap = skeleton.getReducedBones(rackKeep)
+	rackSke = "version 1\n" + skeleton.getReducedSMD(rackKept)
+
+	emitters = smoke["emitters"]
+	groupSize = 1 if len(emitters) <= 30 else max(2, (len(emitters) + 29) // 30)
+	groups = [emitters[i:i + groupSize] for i in range(0, len(emitters), groupSize)]
+	bodygroupLines = []
+	bodygroupRanges = []
+	for gIdx, group in enumerate(groups):
+		part = Model(f"{rackName}_{gIdx:02d}")
+		for e in group:
+			emtrNode = skeleton.getNodeByName(e["name"])
+			parentName = e["bone"]
+			boneNode = skeleton.getNodeByName(parentName) if parentName != "_ROOT" else skeleton.getNodes()[0]
+			mounted = mountedModel(grenade, emtrNode, f"tube_{e['name']}")
+			# Retarget skinning from emitter node idx to its kept ancestor bone & apply renamed materials
+			for vIdx in list(mounted.skin):
+				mounted.skin[vIdx] = ((boneNode.idx, 1.0),)
+			for o in mounted:
+				prefix = f"loadout_{grenade.name}_"
+				for start, mat in list(o.materials.items()):
+					orig = mat[len(prefix):] if mat.startswith(prefix) else mat
+					o.materials[start] = matMap.get(orig, orig)
+			part.mergeModel(mounted)
+		smdFile = f"{rackName}_{gIdx:02d}.smd"
+		smdBody = "\n".join(s.getString() for s in part.getSMD(dontSplit = True, boneMap = rackMap))
+		(qcPath.parent / smdFile).write_text(rackSke + "\n" + smdBody)
+		bodygroupLines.append(f'$bodygroup "smoke_{gIdx:02d}"\n{{\n\tstudio "{smdFile}"\n\tblank\n}}')
+		endTube = sum(len(g) for g in groups[:gIdx + 1])
+		bodygroupRanges.append((gIdx, endTube))
+
+	rackIdle = f"{rackName}_idle.smd"
+	(qcPath.parent / rackIdle).write_text(rackSke)
+	rackQC = qcPath.parent / f"{rackName}.qc"
+	rackQC.write_text(
+		f'$upaxis Y\n$origin 0 0 0 -90\n$modelname "{baseModel}_smoke_rack.mdl"\n{cdMat}\n'
+		+ "\n".join(bodygroupLines)
+		+ f'\n$sequence "idle" "{rackIdle}" loop\n'
+	)
+
+	smoke["projModel"] = f"models/{baseModel}_smoke.mdl"
+	smoke["rackModel"] = f"models/{baseModel}_smoke_rack.mdl"
+	smoke["bodygroups"] = bodygroupRanges
+	return [(projQC, projName), (rackQC, rackName)]
 
 def firstWeapon(blk:dict):
 	return next(iter(weapons(blk)), {})
@@ -273,7 +516,7 @@ def soundEvents(blk:dict, soundConfig:dict = None):
 
 	return {k:v for k, v in events.items() if v}
 
-def exportSounds(gameRoot:str, blk:dict, outDir:str):
+def exportSounds(gameRoot:str, blk:dict, outDir:str, upgraded:bool = True):
 	"""Render the tank's WT FMOD events into wavs in outDir (<addon>/sound/...) the way the game mixes them.
 	Returns {"engine": [(stem, controllers)], "start": stem, ..., "cannon": [stems], "reload": (stem, delay), "coaxial": ([stems], None)}; {} without banks."""
 	from util import wtsound
@@ -352,6 +595,10 @@ def exportSounds(gameRoot:str, blk:dict, outDir:str):
 	for role in ("coaxial", "machinegun"):
 		roles[role] = (render(role, WEAPON_PARAMS, variants = 6), None)
 
+	if tankSmokeWeapon(blk, upgraded):
+		events["smoke_fire"] = "event:/ground/weapon/cannons/grenade_launcher"
+		roles["smoke_fire"] = render("smoke_fire", WEAPON_PARAMS, variants = 1)
+
 	return roles
 
 def getWheels(skeleton):
@@ -413,15 +660,37 @@ def engineLayers(engine:list, soundDir:str):
 
 	return [f'        stream:AddLayer( "{stem}", "{soundDir}/{stem}.wav", {{ {", ".join(map(fmt, ctrl))} }} )' for stem, ctrl in engine]
 
-def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict, tracks:dict = None, options:dict = None, sounds:dict = None, manualYaw:float = MANUAL_TRAVERSE):
+def turretLimits(weapon:dict, turretTilt:float = 0.0):
+	"""Return (yawMin, yawMax, pitchMin, pitchMax, limitsTable) in WT degrees (yaw clamped to [-180, 180], +yaw right)."""
+	limits = weapon.get("limits") or {}
+	yaw = limits.get("yaw") or (-180.0, 180.0)
+	pitch = limits.get("pitch") or (-8.0, 16.0)
+	table = []
+
+	for v in (weapon.get("limitsTable") or {}).values():
+		rows = v if v and isinstance(v[0], (list, tuple)) else (v,)
+
+		for row in rows:
+			if isinstance(row, (list, tuple)) and len(row) == 4:
+				table.append(tuple(float(x) for x in row))
+
+	table.sort(key = lambda r: r[0])
+
+	return float(yaw[0]), float(yaw[1]), float(pitch[0]), float(pitch[1]), table
+
+def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict, tracks:dict = None, options:dict = None, sounds:dict = None, manualYaw:float = MANUAL_TRAVERSE, smoke:dict = None):
 	node = skeleton.getNodeByName
 	turret = node("bone_turret")
 	gun = node("bone_gun")
 	muzzle = node("emtr_gun_flame") or node("bone_gun_barrel")
 	driver = node("bone_camera_driver")
 	weapon = firstWeapon(blk)
-	limits = weapon.get("limits", {})
-	pitch = limits.get("pitch", [-8.0, 16.0])
+	turretTilt = degrees(atan2(turret.wtm[0][1], turret.wtm[0][0])) if turret is not None else 0.0
+	gunTilt = degrees(atan2(gun.wtm[0][1], gun.wtm[0][0])) if gun is not None else 0.0
+	# tilted turret rings (Soviet/Chinese MBTs) raise the gun over the rear deck when rotated 180 deg
+	turretTilt = turretTilt if turret is not None and gun is not None and abs(turretTilt) < 15 and abs(gunTilt - turretTilt) < 1 else 0.0
+	wtYawMin, wtYawMax, wtPitchMin, wtPitchMax, limitsTable = turretLimits(weapon, turretTilt)
+	yawConstrained = wtYawMin > -179.9 or wtYawMax < 179.9
 	options = {**defaultOptions(blk), **(options or {})}
 	mass = min(float(options["mass"]), 50000)
 	massScale = mass / 20000 # base_glide_tank is tuned for its 20000 kg default
@@ -456,16 +725,31 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 	wheelLines = []
 
 	firstRight = next((k + 1 for k, w in enumerate(wheels) if w[0].startswith("bone_wheel_r_")), 1)
+	# middle unsteered road wheels always point along the hull, so neutral turns spin tracks in opposite directions
+	leftDrive = next((k + 1 for k, (name, _, i, cnt, _) in enumerate(wheels) if not name.startswith("bone_wheel_r_") and 0 < i < cnt - 1), 1)
+	rightDrive = next((k + 1 for k, (name, _, i, cnt, _) in enumerate(wheels) if name.startswith("bone_wheel_r_") and 0 < i < cnt - 1), firstRight)
 	wheelBoneLines = []
 
 	for k, (name, p, i, cnt, n) in enumerate(wheels):
 		spin = spinBone(n)
 		steerBone, angle = steer.get(spin, ("", 0.0))
-		# wheeled: War Thunder's per wheel deflection; tracked: Glide's skid steer pushes the end wheels sideways
-		mult = round(angle / maxSteer, 3) if wheeled else (1 if i == 0 else (-1 if i == cnt - 1 else 0))
-		wheelLines.append(f"        self:CreateWheel( {vec((p[0], p[1], p[2] + lift))}, {{ radius = {max(p[2], 5):.1f}, steerMultiplier = {mult} }} ){':SetSoundsEnabled( false )' if mult == 0 else ''}")
-		# a track rolls all its road wheels with its first one
-		drive = k + 1 if wheeled else (firstRight if name.startswith("bone_wheel_r_") else 1)
+		# wheeled: War Thunder's per wheel deflection; tracked: Glide's skid steer pushes the outer/adjacent road wheels
+		if wheeled:
+			mult = round(angle / maxSteer, 3)
+		elif i == 0:
+			mult = 1
+		elif i == cnt - 1:
+			mult = -1
+		elif cnt >= 5 and i == 1:
+			mult = 0.5
+		elif cnt >= 5 and i == cnt - 2:
+			mult = -0.5
+		else:
+			mult = 0
+		soundOff = ':SetSoundsEnabled( false )' if (mult == 0 if wheeled else abs(mult) < 1) else ''
+		wheelLines.append(f"        self:CreateWheel( {vec((p[0], p[1], p[2] + lift))}, {{ radius = {max(p[2], 5):.1f}, steerMultiplier = {mult} }} ){soundOff}")
+		# a track rolls all its road wheels and texture with its unsteered middle wheel
+		drive = k + 1 if wheeled else (rightDrive if name.startswith("bone_wheel_r_") else leftDrive)
 		# steering a bone that also spins would turn the axle off the wheel
 		steerBone = steerBone or name
 		angle = angle if steerBone != spin else 0.0
@@ -473,7 +757,7 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 	cdMaterials = modelPath[:-len(".mdl")]
 	trackLines = []
 
-	for side, wheelIdx in (("l", 1), ("r", firstRight)):
+	for side, wheelIdx in (("l", leftDrive), ("r", rightDrive)):
 		mats, vPerUnit = (tracks or {}).get(side, ((), 0.0))
 
 		if mats and vPerUnit and wheelIdx <= len(wheels):
@@ -517,6 +801,7 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 		]
 
 	mgSounds = {g: soundScript(g.capitalize(), sounds[g][0], 100, 0.8) if sounds.get(g, ((), None))[0] else "" for g in ("coaxial", "machinegun")}
+	smokeFireSound = soundScript("SmokeFire", sounds["smoke_fire"], 120, 0.9) if sounds.get("smoke_fire") else ""
 
 	# coaxial MG: second driver weapon, fired along the cannon from its spot on the turret
 	coax, aa = machineGun(blk, "coaxial"), machineGun(blk, "machinegun")
@@ -525,12 +810,50 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 	aaPitch = node(aa.get("turret", {}).get("gun", "")) if aa else None
 	aaFlash = node(aa.get("flash", "")) if aa else None
 	gunPivot = gamePos(gun) if gun else turretPos
+	muzzlePos = gamePos(muzzle) if muzzle else (turretPos[0] + 100.0, turretPos[1], turretPos[2])
+	turretReach = hypot(muzzlePos[0] - turretPos[0], muzzlePos[1] - turretPos[1]) + 16.0
 	rel = lambda n, base: vec([a - b for a, b in zip(gamePos(n), base)])
 
 	# first person from WT's camera tags: the gunner's turns with the turret, the commander's with the roof MG cupola
 	gunnerCam = node("bone_camera_gunner") or driver
 	commanderCam = node("bone_commander_sight_v")
 	commanderCam = commanderCam if commanderCam and aaYaw and isDescendant(commanderCam, aaYaw) else None
+	hasTilt = abs(turretTilt) > 0.01
+	turretRingSetup = "" if not hasTilt else f'''
+local TurretAngles, BoneTurretAngles
+
+do
+    local ringRt = Matrix()
+    ringRt:SetAngles( Angle( {turretTilt:.3f}, 0, 0 ) )
+    local ringRti = ringRt:GetInverse()
+    local ringB = Matrix()
+    ringB:SetAngles( Angle( 0, 0, 90 ) )
+    local ringBi = ringB:GetInverse()
+    local ringYaw, ringWork, yawAng = Matrix(), Matrix(), Angle()
+
+    -- Rotate around the tilted turret ring axis in entity space: Rt * Ry(yaw) * Rt^-1
+    function TurretAngles( yaw )
+        yawAng[2] = yaw
+        ringYaw:SetAngles( yawAng )
+        ringWork:Set( ringRt )
+        ringWork:Mul( ringYaw )
+        ringWork:Mul( ringRti )
+
+        return ringWork:GetAngles()
+    end
+
+    -- Map entity-space ring rotation into bone_turret's Y-up local frame: B^-1 * T(yaw) * B
+    function BoneTurretAngles( yaw )
+        TurretAngles( yaw )
+        ringYaw:Set( ringBi )
+        ringYaw:Mul( ringWork )
+        ringYaw:Mul( ringB )
+
+        return ringYaw:GetAngles()
+    end
+end
+'''
+	fpRotateLine = "    local turretRot = TurretAngles( fpYaw[2] )\n    fpPos:Rotate( turretRot )" if hasTilt else "    fpPos:Rotate( fpYaw )"
 	firstPerson = [
 		"-- first person from War Thunder's camera tags (bone_camera_gunner turns with the turret, bone_commander_sight_v with the roof MG cupola)",
 		"local fpPos, fpYaw, fpCupola = Vector(), Angle(), Angle()",
@@ -552,7 +875,7 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 			"        end",
 			"",
 			f"        fpPos:Add( {rel(aaYaw, turretPos)} )",
-			"        fpPos:Rotate( fpYaw )",
+			fpRotateLine,
 			"        fpPos:Add( self.TurretOffset )",
 			"",
 			"        return fpPos",
@@ -562,7 +885,7 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 
 	firstPerson += [
 		f"    fpPos:Set( {rel(gunnerCam, turretPos) if gunnerCam else 'Vector( 0, 0, 40 )'} )",
-		"    fpPos:Rotate( fpYaw )",
+		fpRotateLine,
 		"    fpPos:Add( self.TurretOffset )",
 		"",
 		"    return fpPos",
@@ -603,6 +926,236 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 			"        self:SetWTMachineGun( mg )",
 		]
 
+	hasSmoke = bool(smoke and smoke.get("emitters") and smoke.get("projModel") and smoke.get("rackModel"))
+	smokeInfoLine = ""
+	smokeSharedSetup = ""
+	smokeClientSetup = ""
+	smokeClientDraw = ""
+	smokeClientActivate = ""
+	smokeClientCleanup = ""
+	smokeServerSetup = ""
+	if hasSmoke:
+		smokeSlot = 2 if coaxNode else 1
+		smokeSlot += 1
+		smokeInfoLine = f'\nENT.WeaponInfo = {{ [{smokeSlot}] = {{ name = "Smoke Grenades", icon = "glide/icons/shield.png" }} }}'
+		smokeJson = json.dumps({
+			"projModel": smoke["projModel"],
+			"rackModel": smoke["rackModel"],
+			"bodygroups": smoke.get("bodygroups", []),
+			"emitters": [
+				{
+					"pos": [round(v, 2) for v in e["pos"]],
+					"dir": [round(v, 4) for v in e["dir"]],
+					"turret": bool(e["turret"]),
+				}
+				for e in smoke["emitters"]
+			],
+			"salvo": smoke["salvo"],
+			"salvoDelay": smoke["salvoDelay"],
+			"reloadTime": smoke["reloadTime"],
+			"speed": round(smoke["speed"], 1),
+			"activateTime": smoke["activateTime"],
+			"smokeTime": smoke["smokeTime"],
+			"smokeRadius": round(smoke["smokeRadius"], 1),
+		}, separators = (",", ":"))
+		smokeSharedSetup = f"\nlocal SMOKE = util.JSONToTable( [==[{smokeJson}]==] )\n"
+		smokeClientSetup = '''
+    local smokeBurstId = 0
+
+    net.Receive( "WTGlide.SmokeBurst", function()
+        local ent = net.ReadEntity()
+        local fallbackPos = net.ReadVector()
+        local radius = net.ReadFloat()
+        local duration = net.ReadFloat()
+        smokeBurstId = smokeBurstId + 1
+        local id = "WTGlide.Smoke." .. smokeBurstId
+        local ends = CurTime() + duration
+        local lastPos = fallbackPos
+
+        timer.Create( id, 0.2, 0, function()
+            if CurTime() > ends then
+                timer.Remove( id )
+                return
+            end
+
+            local origin = IsValid( ent ) and ent:GetPos() or lastPos
+            lastPos = origin
+
+            local emitter = ParticleEmitter( origin, false )
+            if not IsValid( emitter ) then return end
+
+            for _ = 1, 2 do
+                local offset = Vector( math.Rand( -1, 1 ), math.Rand( -1, 1 ), math.Rand( 0, 0.5 ) ) * ( radius * 0.3 )
+                local p = emitter:Add( "particle/smokesprites_000" .. math.random( 1, 9 ), origin + offset )
+
+                if p then
+                    p:SetDieTime( math.Rand( 3.5, 5.5 ) )
+                    p:SetStartAlpha( 170 )
+                    p:SetEndAlpha( 0 )
+                    p:SetStartSize( radius * 0.22 )
+                    p:SetEndSize( radius * 0.62 )
+                    p:SetRoll( math.Rand( -3, 3 ) )
+                    p:SetRollDelta( math.Rand( -0.4, 0.4 ) )
+                    p:SetAirResistance( 80 )
+                    p:SetGravity( Vector( 0, 0, 12 ) )
+                    p:SetVelocity( Vector( math.Rand( -40, 40 ), math.Rand( -40, 40 ), math.Rand( 10, 45 ) ) )
+                    p:SetColor( 215, 220, 215 )
+                    p:SetLighting( true )
+                    p:SetCollide( true )
+                end
+            end
+
+            emitter:Finish()
+        end )
+    end )'''
+		smokeClientDraw = '''
+        if IsValid( self.wtSmokeRack ) then
+            local fired = self:GetNW2Int( "WTSmokeFired", 0 )
+
+            for _, bg in ipairs( SMOKE.bodygroups ) do
+                self.wtSmokeRack:SetBodygroup( bg[1], fired >= bg[2] and 1 or 0 )
+            end
+
+            self.wtSmokeRack:SetSkin( self:GetSkin() )
+            self.wtSmokeRack:SetupBones()
+            self.wtSmokeRack:DrawModel()
+        end'''
+		smokeClientActivate = '''
+        if IsValid( self.wtSmokeRack ) then self.wtSmokeRack:Remove() end
+        self.wtSmokeRack = ClientsideModel( SMOKE.rackModel, RENDERGROUP_OPAQUE )
+
+        if IsValid( self.wtSmokeRack ) then
+            self.wtSmokeRack:SetParent( self )
+            self.wtSmokeRack:AddEffects( EF_BONEMERGE )
+            self.wtSmokeRack:SetNoDraw( true )
+            self.wtSmokeRack:SetupBones()
+        end'''
+		smokeClientCleanup = '''
+    function ENT:OnDeactivateMisc()
+        BaseClass.OnDeactivateMisc( self )
+
+        if IsValid( self.wtSmokeRack ) then
+            self.wtSmokeRack:Remove()
+            self.wtSmokeRack = nil
+        end
+    end
+
+    function ENT:OnRemove( fullUpdate )
+        if not fullUpdate and IsValid( self.wtSmokeRack ) then
+            self.wtSmokeRack:Remove()
+            self.wtSmokeRack = nil
+        end
+
+        return BaseClass.OnRemove( self, fullUpdate )
+    end
+'''
+		smokeRotate = "local turretAng = TurretAngles( vehicle:GetTurretAngle()[2] )" if abs(turretTilt) > 0.01 else "smokeYaw[2] = vehicle:GetTurretAngle()[2]\n        local turretAng = smokeYaw"
+		smokeServerSetup = f'''    util.AddNetworkString( "WTGlide.SmokeBurst" )
+    local smokePos, smokeDir, smokeYaw = Vector(), Vector(), Angle()
+
+    local function FireSmoke( weapon )
+        local vehicle = weapon.Vehicle
+        local fired = vehicle:GetNW2Int( "WTSmokeFired", 0 )
+        local count = math.min( SMOKE.salvo, #SMOKE.emitters - fired, weapon.ammo )
+        if count <= 0 then return end
+
+        weapon:TakePrimaryAmmo( count )
+        weapon:SetNextPrimaryFire( CurTime() + weapon.FireDelay )
+        weapon:ShootEffects()
+        vehicle:SetNW2Int( "WTSmokeFired", fired + count )
+
+        local vel = vehicle:GetVelocity()
+        local ang = vehicle:GetAngles()
+        {smokeRotate}
+
+        for k = 1, count do
+            local e = SMOKE.emitters[fired + k]
+            smokePos:SetUnpacked( e.pos[1], e.pos[2], e.pos[3] )
+            smokeDir:SetUnpacked( e.dir[1], e.dir[2], e.dir[3] )
+
+            if e.turret then
+                smokePos:Rotate( turretAng )
+                smokePos:Add( vehicle.TurretOffset )
+                smokeDir:Rotate( turretAng )
+            end
+
+            local pos = vehicle:LocalToWorld( smokePos )
+            smokeDir:Rotate( ang )
+            local dir = Vector( smokeDir )
+
+            local proj = ents.Create( "prop_physics" )
+            if IsValid( proj ) then
+                proj:SetModel( SMOKE.projModel )
+                proj:SetPos( pos )
+                proj:SetAngles( dir:Angle() )
+                proj:SetCollisionGroup( COLLISION_GROUP_PROJECTILE )
+                proj:SetOwner( vehicle )
+                proj:Spawn()
+
+                util.SpriteTrail( proj, 0, Color( 220, 220, 220, 150 ), false, 6, 1, 0.45, 0.14, "trails/smoke" )
+
+                local phys = proj:GetPhysicsObject()
+                if IsValid( phys ) then
+                    phys:Wake()
+                    phys:SetVelocityInstantaneous( vel + dir * SMOKE.speed )
+                    phys:AddAngleVelocity( Vector( 0, 120, 0 ) )
+                end
+
+                timer.Simple( SMOKE.activateTime, function()
+                    if not IsValid( proj ) then return end
+
+                    proj:EmitSound( "weapons/smokegrenade/sg_explode.wav", 85, 100, 0.8 )
+
+                    net.Start( "WTGlide.SmokeBurst" )
+                    net.WriteEntity( proj )
+                    net.WriteVector( proj:GetPos() )
+                    net.WriteFloat( SMOKE.smokeRadius )
+                    net.WriteFloat( SMOKE.smokeTime )
+                    net.Broadcast()
+
+                    timer.Simple( SMOKE.smokeTime, function()
+                        if IsValid( proj ) then proj:Remove() end
+                    end )
+                end )
+            end
+        end
+    end
+
+'''
+		weaponLines += [
+			"",
+			"        self:SetNW2Int( \"WTSmokeFired\", 0 )",
+			f'        self:CreateWeapon( "base", {{ FireDelay = {smoke["salvoDelay"]:.3f}, MaxAmmo = {len(smoke["emitters"])}, ReloadDelay = {smoke["reloadTime"]:.1f}, SingleShotSound = "{smokeFireSound}", PrimaryAttack = FireSmoke }} )',
+			"        local smokeWeapon = self.weapons[self.weaponCount]",
+			"        local smokeReload = smokeWeapon.Reload",
+			"        function smokeWeapon:Reload()",
+			"            smokeReload( self )",
+			"            self.Vehicle:SetNW2Int( \"WTSmokeFired\", 0 )",
+			"        end",
+		]
+
+	hasTankSecondary = bool(coaxNode or hasSmoke)
+	tankActivateWeapon = '''
+
+    function ENT:OnActivateWeapon( weapon, slotIndex )
+        BaseClass.OnActivateWeapon( self, weapon, slotIndex )
+        weapon.CrosshairImage = ""
+    end''' if hasTankSecondary else ""
+	tankWeaponThink = '''
+
+    -- Glide only thinks the active weapon; finish holstered reloads as well.
+    function ENT:WeaponThink( selfTbl )
+        for index, weapon in ipairs( self.weapons ) do
+            if index ~= self.weaponState.index and weapon.MaxAmmo > 0 and weapon.ammo == 0 and CurTime() > weapon.nextReload then
+                weapon:Reload()
+                weapon.isReloading = false
+                self:MarkWeaponDataAsDirty()
+            end
+        end
+
+        BaseClass.WeaponThink( self, selfTbl )
+    end''' if hasTankSecondary else ""
+
 	rollingLines = [] if wheeled else [
 		"",
 		"        -- tracks: scale Glide's per surface rolling resistance up (also for surfaces it has no entry for)",
@@ -614,6 +1167,51 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 	]
 	suspensionLines = [f'        {{ bone = "{name}", wheel = {k} }},' for name, k in suspension]
 	nl = "\n"
+	limitRows = ", ".join(f"{{ {y0:.1f}, {y1:.1f}, {p0:.1f}, {p1:.1f} }}" for y0, y1, p0, p1 in limitsTable)
+	limitSetup = []
+	if limitsTable or abs(turretTilt) > 0.01:
+		limitSetup += [
+			f"    local wtYaw = -math.NormalizeAngle( currentAng[2] )",
+			f"    local wtPMin, wtPMax = {wtPitchMin:.1f}, {wtPitchMax:.1f}",
+		]
+		if limitsTable:
+			limitSetup += [
+				f"    for _, lim in ipairs( {{ {limitRows} }} ) do",
+				"        if wtYaw >= lim[1] and wtYaw <= lim[2] then wtPMin, wtPMax = lim[3], lim[4]; break end",
+				"    end",
+			]
+		if abs(turretTilt) > 0.01:
+			limitSetup.append(f"    local tilt = {turretTilt:.3f} * math.cos( math.rad( wtYaw ) )")
+		else:
+			limitSetup.append("    local tilt = 0")
+		limitSetup += [
+			"    self.PitchAngMax = -wtPMax + tilt",
+			"    self.PitchAngMin = -wtPMin + tilt",
+		]
+	yawClampLines = []
+	if yawConstrained:
+		yawClampLines = [
+			f"    local yawMin, yawMax = {-wtYawMax:.1f}, {-wtYawMin:.1f}",
+			"    local aimYaw = math.NormalizeAngle( self:WorldToLocalAngles( ( ( SERVER and driver:GlideGetAimPos() or Glide.GetCameraAimPos() ) - self:LocalToWorld( self.TurretOffset ) ):Angle() )[2] )",
+			"    if aimYaw < yawMin or aimYaw > yawMax then isAimingAtTarget = false end",
+			"    local curYaw = math.NormalizeAngle( currentAng[2] )",
+			"    ang[2] = math.Clamp( curYaw + math.Clamp( ( math.Clamp( aimYaw, yawMin, yawMax ) - curYaw ) * self.YawAcceleration * 0.01, -self.MaxYawSpeed, self.MaxYawSpeed ) * dt, yawMin, yawMax )",
+		]
+
+	limitBlock = (nl + nl.join(limitSetup) + nl) if limitSetup else ""
+	yawClampBlock = (nl + nl.join(yawClampLines) + nl) if yawClampLines else ""
+	mgRotateLine = "        mgPos:Rotate( TurretAngles( self:GetTurretAngle()[2] ) )" if hasTilt else "        yawAng[2] = self:GetTurretAngle()[2]\n        mgPos:Rotate( yawAng )"
+	gunPitchExpr = f"turretAng[1] - {turretTilt:.3f} * math.cos( math.rad( turretAng[2] ) )" if hasTilt else "turretAng[1]"
+	gunYawRotate = "        gunPos:Rotate( TurretAngles( turretAng[2] ) )" if hasTilt else "        turretYaw[2] = turretAng[2]\n        gunPos:Rotate( turretYaw )"
+	turretBoneManip = (
+		"    self:ManipulateBoneAngles( self.turretBone, BoneTurretAngles( turretAng[2] ), false )"
+		if hasTilt else
+		"    -- bones are Y-up (studiomdl $upaxis Y): yaw is around bone Y (pitch slot), elevation around bone Z (yaw slot)\n"
+		"    ang[1] = turretAng[2]\n"
+		"    ang[2] = 0\n"
+		"    ang[3] = 0\n\n"
+		"    self:ManipulateBoneAngles( self.turretBone, ang, false )"
+	)
 
 	return f'''AddCSLuaFile()
 
@@ -623,15 +1221,15 @@ ENT.Base = "base_glide_tank"
 ENT.PrintName = "{printName}"
 
 ENT.GlideCategory = "War Thunder"
-ENT.ChassisModel = "{modelPath}"
+ENT.ChassisModel = "{modelPath}"{smokeInfoLine}
 
 ENT.CanSwitchHeadlights = false
 ENT.CanSwitchTurnSignals = false
 
 ENT.ChassisMass = {mass:.0f}
 ENT.TurretOffset = {vec(turretPos)}
-ENT.PitchAngMax = {-float(pitch[1]):.1f}
-ENT.PitchAngMin = {-float(pitch[0]):.1f}
+ENT.PitchAngMax = {-wtPitchMax + turretTilt:.2f}
+ENT.PitchAngMin = {-wtPitchMin + turretTilt:.2f}
 ENT.MaxYawSpeed = {float(weapon.get("speedYaw", 50)):.1f}
 -- turning in place uses the raw engine torque, which is scaled down for the differential below
 ENT.TurnInPlaceTorqueMultiplier = {35000 * massScale * 3 / maxTorque:.2f}
@@ -656,7 +1254,7 @@ end
 
 -- original War Thunder sounds
 {nl.join(soundShared)}
-
+{smokeSharedSetup}{turretRingSetup}
 {nl.join(firstPerson)}
 
 -- War Thunder: without engine power the turret drive is hand-cranked (realistic broken-drive speed)
@@ -668,14 +1266,16 @@ function ENT:UpdateTurret( driver, dt, currentAng )
     local powered = self:GetEngineState() == 2
     local lastPitch = currentAng[1]
 
-    self.MaxYawSpeed = powered and POWERED_YAW_SPEED or self.WTManualYawSpeed
+    self.MaxYawSpeed = powered and POWERED_YAW_SPEED or self.WTManualYawSpeed{limitBlock}
 
-    local ang, isAimingAtTarget = BaseClass.UpdateTurret( self, driver, dt, currentAng )
+    local ang, isAimingAtTarget = BaseClass.UpdateTurret( self, driver, dt, currentAng ){yawClampBlock}
 
     if not powered then
         local step = self.WTManualPitchSpeed * dt
         ang[1] = lastPitch + math.Clamp( math.NormalizeAngle( ang[1] - lastPitch ), -step, step )
     end
+
+    ang[1] = math.Clamp( ang[1], self.PitchAngMax, self.PitchAngMin )
 
     return ang, isAimingAtTarget
 end
@@ -683,7 +1283,19 @@ end
 if CLIENT then
     ENT.CameraOffset = Vector( -450, 0, {turretPos[2] + 120:.1f} )
     ENT.WTHideCrew = true
-{nl.join(soundClient)}
+{nl.join(soundClient)}{smokeClientSetup}{tankActivateWeapon}
+
+    function ENT:OnPostInitialize()
+        BaseClass.OnPostInitialize( self )
+
+        local mins, maxs = self:GetModelBounds()
+        mins[1] = math.min( mins[1], {turretPos[0] - turretReach:.0f} )
+        mins[2] = math.min( mins[2], {turretPos[1] - turretReach:.0f} )
+        mins[3] = math.min( mins[3], -32 )
+        maxs[1] = math.max( maxs[1], {turretPos[0] + turretReach:.0f} )
+        maxs[2] = math.max( maxs[2], {turretPos[1] + turretReach:.0f} )
+        self:SetRenderBounds( mins, maxs )
+    end
 
     -- no engine power: no servo whine, the hand-crank sound instead (silent if the game has none)
     function ENT:OnUpdateMisc()
@@ -745,7 +1357,7 @@ if CLIENT then
             end
         end
 
-        BaseClass.Draw( self, flags )
+        BaseClass.Draw( self, flags ){smokeClientDraw}
     end
 
     -- road wheels ride the ground like War Thunder's suspension: the track is skinned to them
@@ -775,6 +1387,8 @@ if CLIENT then
     }}
 
     function ENT:OnActivateMisc()
+        BaseClass.OnActivateMisc( self )
+
         self.wheelBones = {{}}
 
         for i, w in ipairs( WHEELS ) do
@@ -788,9 +1402,9 @@ if CLIENT then
         end
 
         self.mgYawBone = self:LookupBone( "{aaYaw.name if aaYaw else ""}" )
-        self.mgPitchBone = self:LookupBone( "{aaPitch.name if aaPitch else ""}" )
+        self.mgPitchBone = self:LookupBone( "{aaPitch.name if aaPitch else ""}" ){smokeClientActivate}
     end
-
+{smokeClientCleanup}
     local spinAng, steerAng = Angle(), Angle()
     local mgAng = Angle()
 
@@ -840,12 +1454,18 @@ if CLIENT then
             mgAng[1] = 0
             mgAng[2] = -math.NormalizeAngle( bodyAng[1] )
             self:ManipulateBoneAngles( self.mgPitchBone, mgAng, false )
+
+            if math.abs( bodyAng[1] - ( self.wtShadowMgPitch or 999 ) ) > 0.05 or math.abs( math.NormalizeAngle( bodyAng[2] - ( self.wtShadowMgYaw or 999 ) ) ) > 0.05 then
+                self.wtShadowMgPitch = bodyAng[1]
+                self.wtShadowMgYaw = bodyAng[2]
+                self:MarkShadowAsDirty()
+            end
         end
     end
 end
 
 if SERVER then
-    -- Glide's torque only rises with rpm (a Clamp with min > max pins it to max), but War Thunder engines
+{smokeServerSetup}    -- Glide's torque only rises with rpm (a Clamp with min > max pins it to max), but War Thunder engines
     -- give constant power: torque grows as rpm falls, up to MinRPMTorque, which is what climbs steep slopes
     function ENT:GetTransmissionTorque( gear, minTorque, maxTorque )
         if minTorque <= maxTorque then
@@ -895,9 +1515,8 @@ if SERVER then
         mg:UpdateUser( self:GetSeatDriver( 2 ) )
 
         -- the roof mount turns with the turret
-        yawAng[2] = self:GetTurretAngle()[2]
         mgPos:Set( self.mgOffset )
-        mgPos:Rotate( yawAng )
+{mgRotateLine}
         mgPos:Add( self.TurretOffset )
         mg:SetLocalPos( mgPos )
     end
@@ -913,6 +1532,58 @@ if SERVER then
     ENT.CanTurnInPlace = {"false" if wheeled else "true"}
     ENT.WTTracked = {"false" if wheeled else "true"}
 
+    -- base_glide_tank requires 100% of wheels grounded for neutral turn, which fails on bumpy terrain
+    function ENT:EngineThink( dt, selfTbl )
+        if not selfTbl.WTTracked then
+            return BaseClass.EngineThink( self, dt, selfTbl )
+        end
+
+        local inputThrottle = self:GetInputFloat( 1, "accelerate", selfTbl )
+        local inputBrake = self:GetInputFloat( 1, "brake", selfTbl )
+        local inputSteer = self:GetInputFloat( 1, "steer", selfTbl )
+        local amphibiousMode = self.IsAmphibious and self:GetWaterState() > 0
+
+        selfTbl.isTurningInPlace = selfTbl.CanTurnInPlace and not amphibiousMode
+            and selfTbl.groundedCount >= math.max( 2, math.ceil( selfTbl.wheelCount * 0.5 ) )
+            and math.abs( selfTbl.forwardSpeed ) < 100 and math.abs( inputSteer ) > 0.1
+            and math.abs( inputThrottle + inputBrake ) < 0.1
+
+        if selfTbl.isTurningInPlace then
+            self:SetGear( 1 )
+
+            local throttle = Glide.ExpDecay( self:GetEngineThrottle(), math.abs( inputSteer ), 4, dt )
+            self:SetEngineThrottle( throttle )
+
+            local minRPM = self:GetMinRPM()
+            local rpmRange = self:GetMaxRPM() - minRPM
+            local currentPower = ( self:GetEngineRPM() - minRPM ) / rpmRange
+
+            currentPower = Glide.ExpDecay( currentPower, throttle * 0.5, 2, dt )
+            self:SetFlywheelRPM( minRPM + rpmRange * currentPower )
+
+            local torque = self:GetMaxRPMTorque() * selfTbl.TurnInPlaceTorqueMultiplier * inputSteer * throttle
+            selfTbl.availableFrontTorque = torque
+            selfTbl.availableRearTorque = -torque
+            selfTbl.frontBrake = 0
+            selfTbl.rearBrake = 0
+        else
+            BaseClass.EngineThink( self, dt, selfTbl )
+        end
+    end
+
+    -- keep wheels aligned along the hull when clutch-braking so the braked inner track doesn't lock yaw
+    function ENT:UpdateSteering( dt, selfTbl )
+        if selfTbl.WTTracked and selfTbl.isTurningInPlace and selfTbl.WTSingleFlow then
+            local inputSteer = Glide.ExpDecay( selfTbl.inputSteer, self:GetInputFloat( 1, "steer" ), 4, dt )
+
+            self:SetSteering( inputSteer )
+            selfTbl.steerAngle[2] = 0
+            selfTbl.inputSteer = inputSteer
+        else
+            BaseClass.UpdateSteering( self, dt, selfTbl )
+        end
+    end
+
     function ENT:WheelThink( dt, selfTbl )
         BaseClass.WheelThink( self, dt, selfTbl )
 
@@ -920,23 +1591,61 @@ if SERVER then
 
         -- Glide gives every wheel a fixed share and drops the airborne ones' share; a track carries the
         -- sprocket's pull to whichever road wheels touch the ground, so they get their side's whole share
-        local count, grounded = {{ 0, 0 }}, {{ 0, 0 }}
+        local count, grounded, avSum = {{ 0, 0 }}, {{ 0, 0 }}, {{ 0, 0 }}
 
         for _, w in Glide.EntityPairs( selfTbl.wheels ) do
             local side = w.state.isOnRightSide and 2 or 1
             count[side] = count[side] + 1
-            grounded[side] = grounded[side] + ( w.state.isOnGround and 1 or 0 )
+
+            if w.state.isOnGround then
+                grounded[side] = grounded[side] + 1
+                avSum[side] = avSum[side] + w.state.angularVelocity
+            end
         end
+
+        local inputSteer = selfTbl.inputSteer or 0
+        local steerMag = math.abs( inputSteer )
+        local innerRight = inputSteer < 0
+        local surfaceGrip = selfTbl.surfaceGrip
 
         for _, w in Glide.EntityPairs( selfTbl.wheels ) do
             local state = w.state
             local side = state.isOnRightSide and 2 or 1
+
+            if grounded[side] > 0 then
+                state.angularVelocity = avSum[side] / grounded[side]
+            end
 
             if state.isOnGround and grounded[side] < count[side] then
                 local scale = count[side] / grounded[side]
                 state.torque = state.torque * scale
                 state.forwardTractionMult = state.forwardTractionMult * scale
             end
+
+            if selfTbl.isTurningInPlace then
+                state.sideTractionMult = state.sideTractionMult * ( selfTbl.WTSingleFlow and 0.25 or 0.35 )
+            elseif steerMag > 0.1 then
+                if state.isOnRightSide == innerRight then
+                    state.torque = state.torque * ( 1 - 0.85 * steerMag )
+                    state.brake = math.max( state.brake, 0.25 * steerMag )
+                else
+                    state.torque = state.torque * ( 1 + 0.50 * steerMag )
+                end
+
+                state.sideTractionMult = state.sideTractionMult * 0.55
+            end
+
+            if state.isOnGround then
+                local grip = surfaceGrip[state.lastSurfaceId] or 1
+                local cap = w.params.forwardTractionMax * grip * state.forwardTractionMult * 0.90
+                state.torque = math.Clamp( state.torque, -cap, cap )
+            end
+        end
+
+        local maxRPM = self:GetTransmissionMaxRPM( self:GetGear(), selfTbl )
+
+        for _, w in Glide.EntityPairs( selfTbl.wheels ) do
+            if w:GetRPM() < -maxRPM then w:SetRPM( -maxRPM ) end
         end
 
         if not selfTbl.WTSingleFlow or not selfTbl.isTurningInPlace then return end
@@ -962,8 +1671,8 @@ if SERVER then
         self:SetSuspensionLength( {REST_COMPRESSION + BUMP_TRAVEL:.1f} )
         self:SetSpringStrength( {springStrength:.0f} )
         self:SetSpringDamper( {springDamper:.0f} )
-        -- and so is its traction: unscaled, a heavy tank slides sideways for ~1.5 s
-        self:SetForwardTractionMax( {50000 * massScale * perWheel:.0f} )
+        -- and so is its traction: cap tracked forward traction to ~0.53g so 1st gear launches without wheelies
+        self:SetForwardTractionMax( {(16000 if not wheeled else 50000) * massScale * perWheel:.0f} )
         self:SetSideTractionMultiplier( {800 * massScale * perWheel:.0f} )
         self:SetSideTractionMax( {12000 * massScale * perWheel:.0f} )
         self:SetSideTractionMin( {10000 * massScale * perWheel:.0f} )
@@ -979,8 +1688,13 @@ if SERVER then
         -- The model already shows wheels and tracks
         for _, w in ipairs( self.wheels ) do
             Glide.HideEntity( w, true )
-        end
 
+            if self.WTTracked then
+                local s = math.min( w:GetRadius() * 0.45, 9.5 )
+                w.state.traceData.mins = Vector( -s, -s, 0 )
+                w.state.traceData.maxs = Vector( s, s, w:GetRadius() * 0.5 )
+            end
+        end
     end
 
     -- muzzle from the turret angles: server bone matrices are stale (they read as the hull origin, so the
@@ -992,13 +1706,12 @@ if SERVER then
     --- World position of a point given relative to the gun's elevation pivot
     function ENT:GetGunPoint( offset )
         local turretAng = self:GetTurretAngle()
-        gunPitch[1] = turretAng[1]
-        turretYaw[2] = turretAng[2]
+        gunPitch[1] = {gunPitchExpr}
 
         gunPos:Set( offset )
         gunPos:Rotate( gunPitch )
         gunPos:Add( gunPivot )
-        gunPos:Rotate( turretYaw )
+{gunYawRotate}
         gunPos:Add( self.TurretOffset )
 
         return self:LocalToWorld( gunPos )
@@ -1006,7 +1719,7 @@ if SERVER then
 
     function ENT:GetProjectileStartPos()
         return self:GetGunPoint( muzzleOffset )
-    end
+    end{tankWeaponThink}
 end
 
 local ang = Angle()
@@ -1019,17 +1732,19 @@ function ENT:ManipulateTurretBones( turretAng )
 
     if not self.turretBone then return end
 
-    -- bones are Y-up (studiomdl $upaxis Y): yaw is around bone Y (pitch slot), elevation around bone Z (yaw slot)
-    ang[1] = turretAng[2]
-    ang[2] = 0
-    ang[3] = 0
+{turretBoneManip}
 
-    self:ManipulateBoneAngles( self.turretBone, ang, false )
+    if CLIENT and ( math.abs( turretAng[1] - ( self.wtShadowPitch or 999 ) ) > 0.05 or math.abs( math.NormalizeAngle( turretAng[2] - ( self.wtShadowYaw or 999 ) ) ) > 0.05 ) then
+        self.wtShadowPitch = turretAng[1]
+        self.wtShadowYaw = turretAng[2]
+        self:MarkShadowAsDirty()
+    end
 
     if not self.gunBone then return end
 
     ang[1] = 0
-    ang[2] = -turretAng[1]
+    ang[2] = -( {gunPitchExpr} )
+    ang[3] = 0
 
     self:ManipulateBoneAngles( self.gunBone, ang, false )
 end
@@ -1059,6 +1774,24 @@ def isAircraft(blk:dict):
 
 def isHelicopter(blk:dict):
 	return "helicopter" in (blk or {})
+
+def hasCountermeasures(blk:dict):
+	slots = (blk or {}).get("WeaponSlots")
+	if not isinstance(slots, dict):
+		return True
+	slotList = slots.get("WeaponSlot") or []
+	for slot in (slotList if isinstance(slotList, list) else [slotList]):
+		if not isinstance(slot, dict):
+			continue
+		presets = slot.get("WeaponPreset") or []
+		for preset in (presets if isinstance(presets, list) else [presets]):
+			if not isinstance(preset, dict):
+				continue
+			ws = preset.get("Weapon") or []
+			for w in (ws if isinstance(ws, list) else [ws]):
+				if isinstance(w, dict) and w.get("trigger") == "countermeasures":
+					return True
+	return False
 
 def findAircraftBlk(assetPath:str, modelName:str):
 	"""gamedata/flightmodels/<model>.blk with its flight model as "fm" and weapon blks as "weaponBlk", or None"""
@@ -1583,7 +2316,7 @@ def aircraftInertia(fm:dict, mass:float):
 	return tuple(values[i] * scale for i in (0, 2, 1))
 
 
-def generateAircraftLua(className:str, printName:str, modelPath:str, skeleton, blk:dict, a2d = None, surfaces:list = None, heatTexture:str = "", sounds:dict = None, options:dict = None):
+def generateAircraftLua(className:str, printName:str, modelPath:str, skeleton, blk:dict, a2d = None, surfaces:list = None, heatTexture:str = "", sounds:dict = None, options:dict = None, *, nozzleModel:str = None, weaponBlocks:dict = None):
 	fm = blk.get("fm") or {}
 	options = {**defaultOptions(blk), **(options or {})}
 	sounds = sounds or {}
@@ -1718,6 +2451,9 @@ def generateAircraftLua(className:str, printName:str, modelPath:str, skeleton, b
 			"    ENT.ThrustSoundHighVolume = 0.4",
 		]
 
+	if not hasCountermeasures(blk):
+		serverLines.append("    ENT.CountermeasureCount = 0")
+
 	if sounds.get("gear"):
 		gear = {k: json.dumps(f"{soundDir}/{v}.wav") for k, v in sounds["gear"].items()}
 		serverLines += [
@@ -1745,6 +2481,74 @@ def generateAircraftLua(className:str, printName:str, modelPath:str, skeleton, b
 	exhaustTexture = blk.get("exhaustTexture", "")
 	exhaustRenderer = rendererLua(className, exhaustTexture, volume)
 	exhaustFiles = 'AddCSLuaFile( "wt_jet_exhaust/volume.lua" )\n    AddCSLuaFile( "wt_jet_exhaust/exhaust.lua" )' if exhaustTexture else ''
+	weaponBlocks = weaponBlocks or {}
+	weaponInfoLine = f"\n{weaponBlocks['weaponInfo']}" if weaponBlocks.get("weaponInfo") else ""
+	clientSetupBlock = f"\n{weaponBlocks['clientSetup']}\n" if weaponBlocks.get("clientSetup") else ""
+	nozzleActivate = ""
+	nozzleAnimate = ""
+	nozzleDraw = ""
+	nozzleCleanup = ""
+	if nozzleModel:
+		nozzleActivate = f'''
+        if IsValid( self.wtNozzleModel ) then self.wtNozzleModel:Remove() end
+        self.wtNozzleModel = ClientsideModel( {json.dumps(nozzleModel)}, RENDERGROUP_OPAQUE )
+
+        if IsValid( self.wtNozzleModel ) then
+            self.wtNozzleModel:SetNoDraw( true )
+            self.wtNozzleModel:SetParent( self )
+            self.wtNozzleModel:SetLocalPos( vector_origin )
+            self.wtNozzleModel:SetLocalAngles( angle_zero )
+            self.wtNozzleModel:SetupBones()
+        end
+
+        self.wtNozzleBones = {{}}
+
+        for _, n in ipairs( NOZZLES ) do
+            self.wtNozzleBones[n.bone] = IsValid( self.wtNozzleModel ) and self.wtNozzleModel:LookupBone( n.bone ) or nil
+        end'''
+		nozzleAnimate = '''
+            local nozzleBone = self.wtNozzleBones and self.wtNozzleBones[n.bone]
+
+            if IsValid( self.wtNozzleModel ) and nozzleBone then
+                self.wtNozzleModel:ManipulateBonePosition( nozzleBone, LerpVector( t, a[1], b[1] ), false )
+                self.wtNozzleModel:ManipulateBoneAngles( nozzleBone, LerpAngle( t, a[2], b[2] ), false )
+            end'''
+		nozzleDraw = '''        if IsValid( self.wtNozzleModel ) then
+            self.wtNozzleModel:SetSkin( self:GetSkin() )
+            self.wtNozzleModel:SetupBones()
+            self.wtNozzleModel:DrawModel()
+        end'''
+		nozzleCleanup = '''        if IsValid( self.wtNozzleModel ) then
+            self.wtNozzleModel:Remove()
+            self.wtNozzleModel = nil
+        end'''
+
+	drawParts = [p for p in (nozzleDraw, weaponBlocks.get("clientDraw", "")) if p]
+	drawMethod = ""
+	if drawParts:
+		drawMethod = "\n    function ENT:Draw( flags )\n        self:DrawModel( flags )\n\n" + "\n\n".join(drawParts) + "\n    end\n"
+
+	cleanupParts = [p for p in (nozzleCleanup, weaponBlocks.get("clientCleanup", "")) if p]
+	cleanupMethods = ""
+	if cleanupParts:
+		cleanupBody = "\n\n".join(cleanupParts)
+		indentedCleanup = "\n".join(("    " + line) if line else "" for line in cleanupBody.splitlines())
+		cleanupMethods = (
+			"\n    function ENT:OnDeactivateMisc()\n"
+			"        BaseClass.OnDeactivateMisc( self )\n\n"
+			+ cleanupBody +
+			"\n    end\n\n"
+			"    function ENT:OnRemove( fullUpdate )\n"
+			"        if not fullUpdate then\n"
+			+ indentedCleanup +
+			"\n        end\n\n"
+			"        return BaseClass.OnRemove( self, fullUpdate )\n"
+			"    end\n"
+		)
+
+	serverSetupBlock = f"\n{weaponBlocks['serverSetup']}\n" if weaponBlocks.get("serverSetup") else ""
+	serverCreateFeaturesBlock = f"\n{weaponBlocks['serverCreateFeatures']}" if weaponBlocks.get("serverCreateFeatures") else ""
+	serverWeaponThinkBlock = f"\n{weaponBlocks['serverWeaponThink']}\n" if weaponBlocks.get("serverWeaponThink") else ""
 	if heli and sounds.get("helicopter"):
 		clientLines += [
 			'    ENT.StartSound = ""', '    ENT.RotorBeatInterval = 0',
@@ -1788,6 +2592,11 @@ def generateAircraftLua(className:str, printName:str, modelPath:str, skeleton, b
 			"    end",
 		]
 
+	headerExtras = "\n".join(block for block in (nl.join(typeLines), nl.join(soundLines)) if block)
+	headerExtras = f"\n{headerExtras}\n" if headerExtras else ""
+	clientBlock = f"\n{nl.join(clientLines)}" if clientLines else ""
+	exhaustBlock = f"{nl.join('    ' + line for line in exhaustFiles.splitlines())}\n" if exhaustFiles else ""
+
 	return f'''AddCSLuaFile()
 
 -- Generated by Dagor Asset Explorer
@@ -1796,9 +2605,7 @@ ENT.Base = "{base}"
 ENT.PrintName = "{printName}"
 
 ENT.GlideCategory = "War Thunder"
-ENT.ChassisModel = "{modelPath}"
-{nl.join(typeLines)}
-{nl.join(soundLines)}
+ENT.ChassisModel = "{modelPath}"{weaponInfoLine}{headerExtras}
 
 DEFINE_BASECLASS( "{base}" )
 
@@ -1807,8 +2614,7 @@ list.Set( "GlideCategories", "War Thunder", {{ name = "War Thunder", icon = "gli
 
 if CLIENT then
     ENT.CameraOffset = Vector( {-length * 1.2:.0f}, 0, {length * 0.2:.0f} )
-    ENT.WTHideCrew = false
-{nl.join(clientLines)}
+    ENT.WTHideCrew = false{clientBlock}{clientSetupBlock}
 
     -- the crew sits inside the cockpit
     hook.Add( "PrePlayerDraw", "WTGlide.HideCrew", function( ply )
@@ -1911,8 +2717,9 @@ if CLIENT then
             end
         end
 
-        self.wtPropSpin = 0
+        self.wtPropSpin = 0{nozzleActivate}
     end
+{drawMethod}{cleanupMethods}
 
     local ang = Angle()
 
@@ -1970,22 +2777,21 @@ if CLIENT then
 
         for _, n in ipairs( NOZZLES ) do
             local bone = self.wtBones[n.bone]
+            local a, b = n.frames[i + 1], n.frames[i + 2]
 
             if bone then
-                local a, b = n.frames[i + 1], n.frames[i + 2]
                 self:ManipulateBonePosition( bone, LerpVector( t, a[1], b[1] ), false )
                 self:ManipulateBoneAngles( bone, LerpAngle( t, a[2], b[2] ), false )
-            end
+            end{nozzleAnimate}
         end
     end
 end
 
 if SERVER then
-    {exhaustFiles}
-    ENT.ChassisMass = {mass:.0f}
+{exhaustBlock}    ENT.ChassisMass = {mass:.0f}
     ENT.SpawnPositionOffset = Vector( 0, 0, 60 )
     ENT.HasLandingGear = {"true" if a2d else "false"} -- gear_up/gear_down sequences baked from the War Thunder animation
-{nl.join(serverLines)}
+{nl.join(serverLines)}{serverSetupBlock}
 
     -- the camo is in the textures, skip Glide's random paint
     function ENT:GetSpawnColor()
@@ -1995,7 +2801,7 @@ if SERVER then
     function ENT:CreateFeatures()
 {inertiaLine}
 {nl.join(seatLines)}
-{nl.join(weaponLines)}
+{nl.join(weaponLines)}{serverCreateFeaturesBlock}
 
 {nl.join(wheelLines)}
 
@@ -2008,11 +2814,11 @@ if SERVER then
         if self.HasLandingGear then
             self:ResetSequence( "gear_down" )
         end
-    end
+    end{serverWeaponThinkBlock}
 end
 '''
 
-def writeAddon(addonDir:str, className:str, printName:str, modelPath:str, skeleton, blk:dict, tracks:dict = None, options:dict = None, gameRoot:str = None, a2d = None, surfaces:list = None, vtfCmd:str = None, nozzleModel:str = None, loadout:list = None, labels:dict = None):
+def writeAddon(addonDir:str, className:str, printName:str, modelPath:str, skeleton, blk:dict, tracks:dict = None, options:dict = None, gameRoot:str = None, a2d = None, surfaces:list = None, vtfCmd:str = None, nozzleModel:str = None, loadout:list = None, labels:dict = None, smoke:dict = None):
 	entDir = path.join(addonDir, "lua", "entities")
 	makedirs(entDir, exist_ok = True)
 	sounds = {}
@@ -2028,21 +2834,24 @@ def writeAddon(addonDir:str, className:str, printName:str, modelPath:str, skelet
 			blk = dict(blk, exhaustTexture = texture)
 		if gameRoot:
 			sounds = exportAircraftSounds(gameRoot, blk, path.join(addonDir, "sound", "wt", className))
-		lua = generateAircraftLua(className, printName, modelPath, skeleton, blk, a2d, surfaces, "", sounds, options)
-		from util.wtweapons import missileLua
+		from util.wtweapons import aircraftWeaponBlocks
 		from util.wtloadout import weaponLabels
 		from util.i18n import LANGUAGE
-		lua += missileLua(loadout or [], (options or {}).get("reloadTimes"),
+		weaponBlocks = aircraftWeaponBlocks(
+			loadout or [],
+			(options or {}).get("reloadTimes"),
 			guns=[w for _, _, _, _, w in aircraftGuns(skeleton, blk)],
-			labels=labels if labels is not None else weaponLabels(gameRoot, LANGUAGE))
-		if nozzleModel:
-			from util.sourceparts import component_patch
-			lua = component_patch(lua, nozzleModel)
+			labels=labels if labels is not None else weaponLabels(gameRoot, LANGUAGE),
+		)
+		lua = generateAircraftLua(
+			className, printName, modelPath, skeleton, blk, a2d, surfaces, "", sounds, options,
+			nozzleModel=nozzleModel, weaponBlocks=weaponBlocks,
+		)
 		with open(path.join(entDir, f"{className}.lua"), "w", encoding = "utf-8") as f:
 			f.write(lua)
 	elif gameRoot and blk:
 		try:
-			sounds = exportSounds(gameRoot, blk, path.join(addonDir, "sound", "wt", className))
+			sounds = exportSounds(gameRoot, blk, path.join(addonDir, "sound", "wt", className), bool((options or {}).get("upgraded", True)))
 		except Exception as e: # the addon still works with Glide's default sounds
 			log.log(f"War Thunder sound export failed: {e}", 2)
 
@@ -2050,7 +2859,7 @@ def writeAddon(addonDir:str, className:str, printName:str, modelPath:str, skelet
 		manualYaw = manualTraverseSpeed(gameRoot) if gameRoot else MANUAL_TRAVERSE
 
 		with open(path.join(entDir, f"{className}.lua"), "w", encoding = "utf-8") as f:
-			f.write(generateLua(className, printName, modelPath, skeleton, blk, tracks, options, sounds, manualYaw))
+			f.write(generateLua(className, printName, modelPath, skeleton, blk, tracks, options, sounds, manualYaw, smoke))
 
 	with open(path.join(addonDir, "addon.json"), "w", encoding = "utf-8") as f:
 		json.dump({"title": f"[Glide] {printName}", "type": "entity", "tags": ["fun"], "ignore": []}, f, indent = 4)

@@ -4,27 +4,23 @@ import sys
 import tempfile
 
 from util import sourceparts as splitter
-from util.sourceparts import component_patch
 
 
 class SukhoiSplitTests(unittest.TestCase):
     def test_shared_ancestors_animate_on_both_models(self):
-        text = '''        self.wtPropSpin = 0
-        for _, n in ipairs( NOZZLES ) do
-            local bone = self.wtBones[n.bone]
-self:ManipulateBonePosition( bone, LerpVector
-self:ManipulateBoneAngles( bone, LerpAngle'''
-        patched = component_patch(text, 'models/wt_glide/su_33_nozzles.mdl')
-        self.assertIn('su_33_nozzles.mdl', patched)
-        self.assertIn('self.wtNozzleModel:SetupBones()', patched)
-        self.assertIn('self.wtNozzleModel:SetSkin(self:GetSkin())', patched)
-        self.assertIn('if bone then', patched)
-        self.assertIn('self:ManipulateBoneAngles(bone, LerpAngle', patched)
-        self.assertIn('target:ManipulateBoneAngles( bone, LerpAngle', patched)
-        self.assertNotIn('if not bone', patched)
-        self.assertIn('self.wtNozzleModel:Remove()', patched)
-        with self.assertRaises(AssertionError):
-            component_patch('unexpected entity layout', 'models/wt_glide/su_33_nozzles.mdl')
+        from types import SimpleNamespace
+        from util.glide import generateAircraftLua
+        node = SimpleNamespace(name='root', wtm=[[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+        skeleton = SimpleNamespace(getNodes=lambda: [node], getNodeByName=lambda name: None)
+        lua = generateAircraftLua('wt_su_33', 'Su-33', 'models/wt_glide/su_33.mdl', skeleton, {'fm': {}},
+                                  nozzleModel='models/wt_glide/su_33_nozzles.mdl')
+        self.assertIn('su_33_nozzles.mdl', lua)
+        self.assertIn('self.wtNozzleModel:SetupBones()', lua)
+        self.assertIn('self.wtNozzleModel:SetSkin( self:GetSkin() )', lua)
+        self.assertIn('self.wtNozzleModel:ManipulateBoneAngles( nozzleBone, LerpAngle', lua)
+        self.assertIn('self.wtNozzleModel:Remove()', lua)
+        self.assertEqual(lua.count('\nif CLIENT then\n'), 1)
+        self.assertEqual(lua.count('\nif SERVER then\n'), 1)
 
     def test_both_components_keep_skin_families_after_collision(self):
         group = '$texturegroup "skinfamilies"\n{\n { "metal" }\n { "skins/custom/metal" }\n}\n'
@@ -57,8 +53,8 @@ self:ManipulateBoneAngles( bone, LerpAngle'''
             writeAddon(d, 'wt_j_16', 'J16', 'models/wt_glide/j_16.mdl', skeleton, {'fm': {}},
                        nozzleModel='models/wt_glide/j_16_nozzles.mdl')
             text = (Path(d) / 'lua/entities/wt_j_16.lua').read_text()
-            self.assertIn('ClientsideModel("models/wt_glide/j_16_nozzles.mdl"', text)
-            self.assertIn('self.wtNozzleModel:SetSkin(self:GetSkin())', text)
+            self.assertIn('ClientsideModel( "models/wt_glide/j_16_nozzles.mdl"', text)
+            self.assertIn('self.wtNozzleModel:SetSkin( self:GetSkin() )', text)
 
     def test_remaps_vertices_and_animation_without_changing_coordinates(self):
         smd = '''version 1

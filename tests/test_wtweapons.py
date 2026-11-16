@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src/dae'))
-from util.wtweapons import ammoCount, reloadTime, compileMissiles, missileLua
+from util.wtweapons import ammoCount, reloadTime, compileMissiles, aircraftWeaponBlocks
 
 
 class WeaponTest(unittest.TestCase):
@@ -29,14 +29,14 @@ class WeaponTest(unittest.TestCase):
     def test_reload_overrides_validate_and_emit_bombs(self):
         for bad in ({'gun': -1}, {'missile': float('nan')}, {'bomb': 4000}, {'typo': 3}):
             with self.assertRaises(ValueError):
-                missileLua([], bad)
+                aircraftWeaponBlocks([], bad)
         bomb = {'weapon': {'blk': 'bomb', 'weaponBlk': {'bomb': {'mass': 200, 'explosiveMass': 100}}, 'arcadeReload': 60}}
-        code = missileLua([bomb], {'bomb': 5, 'gun': 10})
-        self.assertIn('"bomb": 5', code)
-        self.assertIn('ents.Create("glide_projectile")', code)
-        self.assertIn('missile.velocity = vehicle:GetVelocity()', code)
-        self.assertIn('if self.WTTriggerHeld then return end', code)
-        self.assertIn('weapon.ReloadDelay = reload_times.gun or weapon.ReloadDelay', code)
+        blocks = aircraftWeaponBlocks([bomb], {'bomb': 5, 'gun': 10})
+        self.assertIn('"bomb":5', blocks['serverSetup'].replace(' ', ''))
+        self.assertIn('ents.Create( "glide_projectile" )', blocks['serverCreateFeatures'])
+        self.assertIn('missile.velocity = vehicle:GetVelocity()', blocks['serverCreateFeatures'])
+        self.assertIn('if self.WTTriggerHeld then return end', blocks['serverCreateFeatures'])
+        self.assertIn('weapon.ReloadDelay = reloadTimes.gun or weapon.ReloadDelay', blocks['serverCreateFeatures'])
 
     def test_external_gun_pods_stay_independently_selectable(self):
         from util.glide import aircraftGuns
@@ -110,39 +110,43 @@ class WeaponTest(unittest.TestCase):
             self.assertEqual(len(targets), 2)
             self.assertIn('metal\n', targets[0][0].with_suffix('.smd').read_text())
             mount['container'] = pod['prefix']
-            code = missileLua([mount, pod])
-            self.assertIn('round.container == mount.container', code)
-            self.assertIn('vehicle:SetNW2Bool(mount.container, true)', code)
-            self.assertIn('self.Vehicle:SetNW2Bool(mount.container, false)', code)
-            self.assertIn('self.wtDroppedPods', code)
-            self.assertIn('pod.Model:Remove()', code)
+            blocks = aircraftWeaponBlocks([mount, pod])
+            clientDraw = blocks['clientDraw']
+            clientCleanup = blocks['clientCleanup']
+            serverCreate = blocks['serverCreateFeatures']
+            self.assertIn('round.container == mount.container', serverCreate)
+            self.assertIn('vehicle:SetNW2Bool( mount.container, true )', serverCreate)
+            self.assertIn('self.Vehicle:SetNW2Bool( mount.container, false )', serverCreate)
+            self.assertIn('self.wtDroppedPods', clientDraw)
+            self.assertIn('pod.Model:Remove()', clientCleanup)
             with self.assertRaisesRegex(ValueError, 'independent shell'):
-                missileLua([mount])
-            self.assertIn(pod['model'], code)
-            self.assertIn('ClientsideModel(mount.model', code)
-            self.assertIn('self:GetNW2Bool(mount.prefix, false)', code)
-            self.assertIn('vehicle:SetNW2Bool(mount.prefix, true)', code)
-            self.assertIn('self.Vehicle:SetNW2Bool(mount.prefix, false)', code)
-            self.assertIn('if IsValid(model) then model:Remove() end', code)
+                aircraftWeaponBlocks([mount])
+            self.assertIn(pod['model'], blocks['clientSetup'])
+            self.assertIn('ClientsideModel( mount.model', clientDraw)
+            self.assertIn('self:GetNW2Bool( mount.prefix, false )', clientDraw)
+            self.assertIn('vehicle:SetNW2Bool( mount.prefix, true )', serverCreate)
+            self.assertIn('self.Vehicle:SetNW2Bool( mount.prefix, false )', serverCreate)
+            self.assertIn('if IsValid( model ) then model:Remove() end', clientCleanup)
 
     def test_launcher_aliases_share_projectile_group(self):
         import json
         import re
         mounts = [{'weapon': {'trigger': 'aam', 'blk': name, 'weaponBlk': {'rocket': {'bulletName': 'pl8b'}}}}
                   for name in ('cn_pl8b_default.blk', 'cn_pl8b.blk')]
-        lua = missileLua(mounts)
-        groups = json.loads(re.search(r'local missile_groups = util.JSONToTable\(\[==\[(.*?)\]==\]\)', lua)[1])
+        blocks = aircraftWeaponBlocks(mounts)
+        groups = json.loads(re.search(r'local missileGroups = util\.JSONToTable\( \[==\[(.*?)\]==\] \)', blocks['serverSetup'])[1])
         self.assertEqual([len(g) for g in groups], [2])
 
     def test_runtime_uses_single_mount_and_restores_only_own_group(self):
         mount = {'weapon': {'blk': 'launcher', 'weaponBlk': {'rocket': {'bulletName': 'test'}}}}
-        lua = missileLua([mount, mount])
-        self.assertIn('local mount = self.WTMounts[index]', lua)
-        self.assertIn('if not IsValid(missile) then return end', lua)
-        self.assertIn('vehicle:FindBodygroupByName(mount.prefix), 1', lua)
-        self.assertIn('for _, mount in ipairs(self.WTMounts)', lua)
-        self.assertIn('self.projectileOffsetIndex = 0', lua)
-        self.assertIn('index ~= self.weaponState.index', lua)
+        blocks = aircraftWeaponBlocks([mount, mount])
+        serverCreate = blocks['serverCreateFeatures']
+        self.assertIn('local mount = self.WTMounts[index]', serverCreate)
+        self.assertIn('if not IsValid( missile ) then return end', serverCreate)
+        self.assertIn('vehicle:FindBodygroupByName( mount.prefix ), 1', serverCreate)
+        self.assertIn('for _, mount in ipairs( self.WTMounts )', serverCreate)
+        self.assertIn('self.projectileOffsetIndex = 0', serverCreate)
+        self.assertIn('index ~= self.weaponState.index', blocks['serverWeaponThink'])
 
 
 if __name__ == '__main__':

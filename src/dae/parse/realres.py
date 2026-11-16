@@ -806,6 +806,12 @@ class Model(Terminable):
 		self.__objects.append(obj)
 
 		return obj
+
+	def appendMaterials(self, materials:Iterable[MaterialData]):
+		materials = tuple(materials or ())
+		if not materials:
+			return
+		self.__materials = (*self.__materials, *materials) if self.__materials is not None else materials
 	
 	def mergeModel(self, mdl):
 		mdl:Model = mdl

@@ -67,7 +67,7 @@ class WeaponLabelsTest(unittest.TestCase):
         import json
         import re
         from copy import deepcopy
-        from util.wtweapons import missileLua
+        from util.wtweapons import aircraftWeaponBlocks
         guns = [{'blk': 'cannon.blk', 'bullets': 150},
                 {'blk': 'cannon.blk', 'trigger': 'additional gun', 'bullets': 260}]
         mounts = [{'weapon': {'blk': name + '.blk', 'trigger': 'aam', 'bullets': 1,
@@ -77,36 +77,38 @@ class WeaponLabelsTest(unittest.TestCase):
                                 'weaponBlk': {'bomb': {'bulletName': 'bomb'}}}}]
         labels = self.labels() | {'weapons/cn_pl12a': 'PL-12A 空对空导弹'}
         original = deepcopy((guns, mounts))
-        code = missileLua(mounts, guns=guns, labels=labels)
-        info = json.loads(re.search(r'ENT.WeaponInfo = util.JSONToTable\(\[==\[(.*?)\]==\]\)', code)[1])
+        blocks = aircraftWeaponBlocks(mounts, guns=guns, labels=labels)
+        info = json.loads(re.search(r'ENT\.WeaponInfo = util\.JSONToTable\( \[==\[(.*?)\]==\] \)', blocks['weaponInfo'])[1])
         self.assertEqual([w['name'] for w in info],
                          ['23 毫米机炮', '23 毫米机炮', 'PL-8B 空对空导弹', 'PL-12A 空对空导弹', '250 kg bomb; HE'])
-        self.assertLess(code.index('ENT.WeaponInfo'), code.index('if SERVER then'))
         self.assertEqual((guns, mounts), original)
-        unnamed = missileLua(mounts)
-        self.assertEqual(code[code.index('if SERVER then'):], unnamed[unnamed.index('if SERVER then'):])
+        unnamed = aircraftWeaponBlocks(mounts)
+        self.assertEqual(blocks['serverSetup'], unnamed['serverSetup'])
+        self.assertEqual(blocks['serverCreateFeatures'], unnamed['serverCreateFeatures'])
 
     def test_hud_name_fallback_and_lua_delimiter_are_safe(self):
         import json
         import re
-        from util.wtweapons import missileLua
+        from util.wtweapons import aircraftWeaponBlocks
         guns = [{'blk': 'unknown.blk'}, {'blk': 'quoted.blk'}]
         label = '炮 "A" \\ test\n]==]'
-        code = missileLua([], guns=guns, labels={'weapons/quoted': label})
-        info = json.loads(re.search(r'ENT.WeaponInfo = util.JSONToTable\(\[==\[(.*?)\]==\]\)', code)[1])
+        blocks = aircraftWeaponBlocks([], guns=guns, labels={'weapons/quoted': label})
+        info = json.loads(re.search(r'ENT\.WeaponInfo = util\.JSONToTable\( \[==\[(.*?)\]==\] \)', blocks['weaponInfo'])[1])
         self.assertEqual([w['name'] for w in info], ['unknown', label])
 
     def test_write_addon_connects_native_labels_to_client_metadata(self):
         from pathlib import Path
         from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
         from util.glide import writeAddon
-        gun = {'blk': 'cannon.blk', 'bullets': 150}
+        gun = {'blk': 'cannon.blk', 'bullets': 150, 'arcadeReload': 40.0}
+        node = SimpleNamespace(name='root', wtm=[[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+        skeleton = SimpleNamespace(getNodes=lambda: [node], getNodeByName=lambda name: None)
         with TemporaryDirectory() as folder, \
-                patch('util.glide.generateAircraftLua', return_value='-- aircraft\n'), \
                 patch('util.glide.exportAircraftSounds', return_value={}), \
                 patch('util.glide.aircraftGuns', return_value=[('base', [], .1, 10, gun)]), \
                 patch('util.wtloadout.weaponLabels', return_value=self.labels()) as native:
-            writeAddon(folder, 'wt_test', 'test', 'test.mdl', None, {'fm': {}}, gameRoot='game')
+            writeAddon(folder, 'wt_test', 'test', 'test.mdl', skeleton, {'fm': {}}, gameRoot='game')
             native.assert_called_once()
             code = (Path(folder) / 'lua/entities/wt_test.lua').read_text(encoding='utf-8')
             self.assertIn('ENT.WeaponInfo = util.JSONToTable', code)

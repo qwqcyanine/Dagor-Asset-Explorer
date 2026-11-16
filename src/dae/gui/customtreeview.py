@@ -19,7 +19,7 @@ from threading import Event
 from parse.material import DDSx, DDSxTexturePack2
 from parse.realres import RendInst, DynModel, ModelContainer, GeomNodeTree
 from gui.glideOptionsDialog import GlideOptionsDialog
-from util.glide import GLIDE_KEEP_BONES, TRACK_R_SUFFIX, cacheHQTextures, defaultOptions, findGameRoot, findTankBlk, glideCollisionNodes, hiddenNodes, splitTrackMaterials, writeAddon
+from util.glide import GLIDE_KEEP_BONES, TRACK_R_SUFFIX, cacheHQTextures, compileSmokeModels, defaultOptions, findGameRoot, findTankBlk, glideCollisionNodes, hiddenNodes, prepareTankSmoke, splitTrackMaterials, writeAddon
 from util.glide import aircraftCollisionNodes, aircraftHiddenNodes, aircraftKeepBones, controlSurfaces, findAircraftBlk, findAircraftCollision, gearSequences, isAircraft
 from util.a2d import A2D
 import re
@@ -960,11 +960,14 @@ class ExportToGlide(ExportToSource):
 		if self.loadout:
 			from util.wtweapons import compileMissiles
 			targets += compileMissiles(targets[0][0], self.loadout)
+		if getattr(self, "smoke", None):
+			targets += compileSmokeModels(targets[0][0], self.smdl.model.skeleton, self.smoke)
 		return targets
 
 	def prepareSourceModel(self, smdl):
 		self.splitNozzles = False
 		self.loadout = []
+		self.smoke = None
 		if isAircraft(self.blk):
 			if self.options.get("loadout"):
 				from util.wtloadout import apply
@@ -987,6 +990,10 @@ class ExportToGlide(ExportToSource):
 		smdl.collisionNodeFilter = glideCollisionNodes
 		smdl.model.removeObjects(hiddenNodes(self.blk, self.options["upgraded"]))
 		self.tracks = splitTrackMaterials(smdl.model)
+		try:
+			self.smoke = prepareTankSmoke(self.blk, smdl.model, findGameRoot(self.item.asset.filePath), self.options["upgraded"])
+		except Exception as error:
+			log.log(f"Smoke launcher export skipped: {error}", 2)
 
 	def save(self, output:str):
 		asset:DynModel = self.item.asset
@@ -1016,7 +1023,7 @@ class ExportToGlide(ExportToSource):
 
 		skeleton = self.smdl.model.skeleton
 		self.setTaskStatus(tr("Extracting War Thunder sounds"))
-		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk, self.tracks, self.options, findGameRoot(asset.filePath), self.a2d, self.surfaces, SETTINGS.getValue(SETTINGS_VTFCMD_PATH) or VTFCMD_PATH, nozzleModel = f"models/{self.modelPath}/{name}_nozzles.mdl" if self.splitNozzles else None, loadout = self.loadout, labels = getattr(self, "weaponLabels", None))
+		writeAddon(addonDir, className, name.replace("_", " "), f"models/{self.modelPath}/{name}.mdl", skeleton, blk, self.tracks, self.options, findGameRoot(asset.filePath), self.a2d, self.surfaces, SETTINGS.getValue(SETTINGS_VTFCMD_PATH) or VTFCMD_PATH, nozzleModel = f"models/{self.modelPath}/{name}_nozzles.mdl" if self.splitNozzles else None, loadout = self.loadout, labels = getattr(self, "weaponLabels", None), smoke = getattr(self, "smoke", None))
 		log.log(f"Glide addon written to {addonDir}")
 
 class ExportLODsToSource(ExportToSource):
