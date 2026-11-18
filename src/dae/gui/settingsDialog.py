@@ -5,7 +5,7 @@ from os import path
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QDialog, QWidget, QCheckBox, QLineEdit, QPushButton, QFileDialog, QVBoxLayout, QTabWidget, QLabel, QComboBox, QFormLayout, QApplication
+from PyQt5.QtWidgets import QDialog, QWidget, QCheckBox, QLineEdit, QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QLabel, QComboBox, QFormLayout, QApplication
 from PyQt5.uic import loadUi
 from util.misc import getUIPath, openFile
 from util.enums import *
@@ -46,6 +46,7 @@ class SettingsDialog(QDialog):
 
 	exportGameInfoLayout:QVBoxLayout
 	exportSMDLayout:QVBoxLayout
+	verticalLayout_2:QVBoxLayout
 
 	
 	def __init__(self, parent:QWidget):
@@ -79,6 +80,7 @@ class SettingsDialog(QDialog):
 		self.setupCheckBox(self.exportSMD, SETTINGS_EXPORT_SMD, self.exportSMDLayout)
 		self.setupCheckBox(self.noMDL, SETTINGS_NO_MDL)
 		self.setupCheckBox(self.dontExportExistingTextures, SETTINGS_DONT_EXPORT_EXISTING_TEXTURES)
+		self.setupVtfFormatBox()
 
 
 		self.studiomdlLine.setText(SETTINGS.getValue(SETTINGS_STUDIOMDL_PATH))
@@ -120,6 +122,20 @@ class SettingsDialog(QDialog):
 
 		self.tabWidget.addTab(tab, tr("Appearance"))
 	
+	def setupVtfFormatBox(self):
+		row = QHBoxLayout()
+		row.addWidget(QLabel(tr("VTF texture format")))
+		self.vtfFormatBox = QComboBox()
+		self.vtfFormatBox.addItem("DXT5", VTF_FORMAT_DXT5)
+		self.vtfFormatBox.addItem("RGBA8888", VTF_FORMAT_RGBA8888)
+		self.selectComboData(self.vtfFormatBox, SETTINGS.getValue(SETTINGS_VTF_FORMAT))
+		self.vtfFormatBox.currentIndexChanged.connect(self.vtfFormatChanged)
+		row.addWidget(self.vtfFormatBox)
+		self.verticalLayout_2.addLayout(row)
+
+	def vtfFormatChanged(self):
+		SETTINGS.setValue(SETTINGS_VTF_FORMAT, self.vtfFormatBox.currentData())
+
 	@staticmethod
 	def selectComboData(box:QComboBox, data:str):
 		idx = box.findData(data)

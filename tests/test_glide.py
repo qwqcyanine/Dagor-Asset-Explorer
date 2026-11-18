@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "dae"))
-from parse.realres import Model, SMD, bindNode
-from util.glide import TRACK_R_SUFFIX, defaultOptions, gearbox, generateLua, glideCollisionNodes, splitTrackMaterials, turretLimits
+from parse.realres import Model, SMD, SourceModel, bindNode
+from util.glide import GLIDE_KEEP_BONES, TRACK_R_SUFFIX, defaultOptions, gearbox, generateLua, glideCollisionNodes, splitTrackMaterials, tankMassCenter, tankSuspension, turretLimits
 
 
 def track(mdl:Model, name:str, mat:str, vPerMeter:float):
@@ -46,7 +46,10 @@ class GlideTest(unittest.TestCase):
     def test_default_options_from_blk(self):
         blk = {"mass": 50000.0, "maxFwdSpeed": 75.0, "maxRevSpeed": 10.0,
             "VehiclePhys": {"Mass": {"TakeOff": 46000.0}, "mechanics": {"steerType": "differential"}}}
-        self.assertEqual(defaultOptions(blk), {"singleFlow": False, "mass": 46000.0, "maxFwdSpeed": 75.0, "maxRevSpeed": 10.0, "upgraded": True, "wheeled": False})
+        self.assertEqual(defaultOptions(blk), {
+            "singleFlow": False, "mass": 46000.0, "maxFwdSpeed": 75.0, "maxRevSpeed": 10.0,
+            "suspensionSag": 12.5, "suspensionDamping": 50.0, "upgraded": True, "wheeled": False,
+        })
         self.assertTrue(defaultOptions(None)["singleFlow"])
         self.assertFalse(defaultOptions({"VehiclePhys": {"mechanics": {"steerType": "clutch_braking", "neutralGearRatio": 2.1}}})["singleFlow"])
         self.assertTrue(defaultOptions({"VehiclePhys": {"mechanics": {"steerType": "clutch_braking"}}})["singleFlow"])
@@ -205,17 +208,32 @@ class GlideTest(unittest.TestCase):
             def __init__(self, name, x, y, z):
                 self.name, self.children, self.parent = name, [], None
                 self.wtm = [[1, 0, 0, x], [0, 1, 0, y], [0, 0, 1, z]]
+        for b in ("wheel_l_drive", "wheel_r_drive", "wheel_l_front", "wheel_r_front", "wheel_l_back", "wheel_l_top_01", "wheel_r_top_04"):
+            self.assertIn(b, GLIDE_KEEP_BONES)
         nodes = [Node(f"bone_wheel_{s}_0{i}", x, 0.4, z) for s, z in (("l", 1.4), ("r", -1.4)) for i, x in enumerate((2, 0, -2))]
+        nodes += [
+            Node("wheel_l_drive", -2.5, 0.6, 1.4),
+            Node("wheel_r_drive", -2.5, 0.6, -1.4),
+            Node("wheel_l_front", 2.5, 0.6, 1.4),
+            Node("wheel_l_top_01", 0.5, 0.8, 1.4),
+        ]
         class Skeleton:
             def getNodeByName(self, name): return next((n for n in nodes if n.name == name), None)
             def getNodes(self): return nodes
         lua = generateLua("wt_x", "x", "models/wt_glide/x.mdl", Skeleton(), None,
                           {"l": (["m"], 0.05), "r": (["m_r"], 0.05)}, options = {"mass": 40000})
         # middle unsteered road wheels (2 and 5), not steered corner wheels (1 and 4)
+        self.assertEqual(lua.count("self:CreateWheel("), 6)
         self.assertIn('{ wheel = 2, scale =', lua)
         self.assertIn('{ wheel = 5, scale =', lua)
         self.assertIn('{ spin = "bone_wheel_l_01", steer = "bone_wheel_l_01", wheel = 2, angle = 0.0 }', lua)
         self.assertIn('{ spin = "bone_wheel_r_01", steer = "bone_wheel_r_01", wheel = 5, angle = 0.0 }', lua)
+        self.assertIn('{ spin = "wheel_l_drive", steer = "", wheel = 2, angle = 0.0 }', lua)
+        self.assertIn('{ spin = "wheel_l_front", steer = "", wheel = 2, angle = 0.0 }', lua)
+        self.assertIn('{ spin = "wheel_l_top_01", steer = "", wheel = 2, angle = 0.0 }', lua)
+        self.assertIn('{ spin = "wheel_r_drive", steer = "", wheel = 5, angle = 0.0 }', lua)
+        wheeled_lua = generateLua("wt_w", "w", "models/wt_glide/w.mdl", Skeleton(), {"VehiclePhys": {"mechanics": {"tracked": False}}})
+        self.assertNotIn("wheel_l_drive", wheeled_lua)
         # 40000 kg -> massScale 2.0, 6 wheels -> perWheel 1.0 -> 16000 * 2.0 * 1.0 = 32000 (~0.53g)
         self.assertIn("SetForwardTractionMax( 32000 )", lua)
         self.assertIn("if w:GetRPM() < -maxRPM then w:SetRPM( -maxRPM ) end", lua)
@@ -225,9 +243,93 @@ class GlideTest(unittest.TestCase):
 
         six = [Node(f"bone_wheel_{s}_{i:02d}", x, 0.4, z) for s, z in (("l", 1.4), ("r", -1.4)) for i, x in enumerate((3, 2, 1, 0, -1, -2), 1)]
         six_lua = generateLua("wt_x6", "x6", "models/wt_glide/x6.mdl",
-            type("S", (), {"getNodeByName": lambda self, n: None, "getNodes": lambda self: six})(), None)
+            type("S", (), {"getNodeByName": lambda self, n: None, "getNodes": lambda self: six})(),
+            {"VehiclePhys": {"mechanics": {"neutralGearRatio": 7.5, "gearRatios": {"ratio": [-6.0, 0.0, 7.5, 0.8]}}}})
         self.assertEqual(six_lua.count("steerMultiplier = 0.5 } ):SetSoundsEnabled( false )"), 2)
         self.assertEqual(six_lua.count("steerMultiplier = -0.5 } ):SetSoundsEnabled( false )"), 2)
+        # 6-wheel sides pick the unsteered middle wheel (index 3 -> wheels 4 and 10), not i=1 (steerMultiplier=0.5)
+        self.assertIn('{ spin = "bone_wheel_l_01", steer = "bone_wheel_l_01", wheel = 4, angle = 0.0 }', six_lua)
+        self.assertIn('{ spin = "bone_wheel_r_01", steer = "bone_wheel_r_01", wheel = 10, angle = 0.0 }', six_lua)
+        self.assertIn("function ENT:SwitchGear( index, _cooldown )", six_lua)
+        self.assertIn("self.switchCD = 0", six_lua)
+        self.assertIn("local ratio = selfTbl.isTurningInPlace and 7.50 or selfTbl.gearRatios[gear]", six_lua)
+        self.assertIn("if selfTbl.WTTracked and selfTbl.isTurningInPlace then", six_lua)
+        self.assertNotIn("if selfTbl.WTTracked and selfTbl.isTurningInPlace and selfTbl.WTSingleFlow then", six_lua)
+        self.assertIn("state.sideTractionMult = state.sideTractionMult * 0.15", six_lua)
+        self.assertLess(six_lua.index("if w:GetRPM() < -maxRPM then"), six_lua.index("avSum[side] = avSum[side] + w.state.angularVelocity"))
+
+    def test_tank_mass_center_and_qc_emission(self):
+        from types import SimpleNamespace as NS
+        blk = {"VehiclePhys": {"Mass": {"CenterOfGravity": (0.15, 0.50, 0.00), "CenterOfGravityClampY": (0.0, 0.6)}}}
+        self.assertEqual(tankMassCenter(blk), (6.0, 0.0, 20.0))
+        clampedBlk = {"VehiclePhys": {"Mass": {"CenterOfGravity": (0.15, 2.0, 0.00), "CenterOfGravityClampY": (0.0, 0.8)}}}
+        self.assertEqual(tankMassCenter(clampedBlk), (6.0, 0.0, 32.0))
+
+        nodes = [
+            NS(name="bone_wheel_l_01", wtm=[[1, 0, 0, 1.0], [0, 1, 0, 0.4], [0, 0, 1, 1.4]]),
+            NS(name="bone_wheel_r_01", wtm=[[1, 0, 0, -0.5], [0, 1, 0, 0.4], [0, 0, 1, -1.4]]),
+        ]
+        skeleton = NS(getNodes=lambda: nodes, getNodeByName=lambda n: None)
+        mc = tankMassCenter(None, skeleton)
+        self.assertEqual(mc, (10.0, 0.0, 16.0))
+
+        col = NS(name="tank_col", getSurfaceProp=lambda: "metal")
+        smdl = SourceModel("tank", Model("tank"), collision=col)
+        smdl.massCenter = (6.0, 0.0, 20.0)
+        qc = smdl.getQC("wt_glide", {"hull": ["hull"]})
+        self.assertIn("$collisionmodel \"tank_col.smd\"\n{\n\t$automass\n\t$concave\n\t$masscenter 6.00 0.00 20.00\n}", qc)
+
+    def test_wt_suspension_autofill_dialog_and_lua(self):
+        from PyQt5.QtWidgets import QApplication
+        from gui.glideOptionsDialog import GlideOptionsDialog
+        from types import SimpleNamespace as NS
+
+        blk = {
+            "maxFwdSpeed": 75.0,
+            "maxRevSpeed": 34.0,
+            "VehiclePhys": {
+                "Mass": {"TakeOff": 55000.0},
+                "mechanics": {"neutralGearRatio": 7.5},
+                "suspension": {
+                    "suspensionOffsets": (-0.12, -0.12, 0.20),
+                    "dampeningRelaxationRatio": 0.40,
+                    "dampeningCompressionRatio": 0.15,
+                },
+            },
+        }
+        self.assertEqual(tankSuspension(blk), (12.0, 20.0, 52.0))
+        self.assertEqual(tankSuspension(blk, 14), (12.0, 20.0, 56.1))
+        opts = defaultOptions(blk)
+        self.assertEqual(opts["suspensionSag"], 12.0)
+        self.assertEqual(opts["suspensionDamping"], 52.0)
+
+        app = QApplication.instance() or QApplication([])
+        dlg = GlideOptionsDialog(None, opts, "ztz_99a")
+        self.assertAlmostEqual(dlg.spins["suspensionSag"].value(), 12.0, places=1)
+        self.assertAlmostEqual(dlg.spins["suspensionDamping"].value(), 52.0, places=1)
+        self.assertIn("5–9 cm", dlg.suspensionHint.text())
+        self.assertIn("70–100%", dlg.suspensionHint.text())
+        self.assertIn("5–9 cm", dlg.spins["suspensionSag"].toolTip())
+        self.assertIn("70–100%", dlg.spins["suspensionDamping"].toolTip())
+        self.assertFalse(dlg.suspensionHint.isHidden())
+        dlg.vehicleType.setCurrentIndex(1)
+        self.assertTrue(dlg.suspensionHint.isHidden())
+        dlg.vehicleType.setCurrentIndex(0)
+        out = dlg.options()
+        self.assertAlmostEqual(out["suspensionSag"], 12.0, places=1)
+        self.assertAlmostEqual(out["suspensionDamping"], 52.0, places=1)
+
+        nodes = [NS(name=f"bone_wheel_{s}_{i:02d}", wtm=[[1, 0, 0, x], [0, 1, 0, 0.45], [0, 0, 1, z]], children=[], parent=None)
+                 for s, z in (("l", 1.4), ("r", -1.4)) for i, x in enumerate((2.5, 1.5, 0.5, -0.5, -1.5, -2.5), 1)]
+        skeleton = NS(getNodes=lambda: nodes, getNodeByName=lambda n: None)
+        lua = generateLua("wt_ztz_99a", "ZTZ-99A", "models/wt_glide/ztz_99a.mdl", skeleton, blk, options=out)
+        self.assertIn("local WHEEL_LIFT = 8.0", lua)
+        self.assertIn("suspensionPos[2] = self:GetWheelOffset( s.wheel ) + WHEEL_LIFT", lua)
+        self.assertIn("self:SetSuspensionLength( 12.8 )", lua)
+        self.assertIn("self:SetSpringStrength( 7813 )", lua)
+        self.assertIn("self:SetSpringDamper( 48448 )", lua)
+        self.assertNotIn("OnSimulatePhysics", lua)
+        self.assertNotIn("WHEEL_DROOP", lua)
 
 
 class WTSoundTest(unittest.TestCase):

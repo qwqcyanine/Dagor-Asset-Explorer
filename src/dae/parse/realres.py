@@ -378,6 +378,7 @@ class SourceModel(Terminable):
 		self.__keepBones = keepBones # reduce the skeleton to these bones (+ ancestors), other meshes follow their nearest kept ancestor
 		self.__boneMap = None
 		self.collisionNodeFilter = None # callable(node names) -> names to keep in the collision model
+		self.massCenter:tuple[float, float, float] = None # optional Source-space $masscenter override (x, y, z)
 		self.sequences:dict[str, str] = {} # extra $sequence name -> SMD "nodes ... skeleton ... end" text (30 fps)
 		self.__model:Model = model
 		self.__allLODs:tuple[Model] = allLODs
@@ -443,6 +444,8 @@ class SourceModel(Terminable):
 			lines.append("{")
 			lines.append("\t$automass")
 			lines.append("\t$concave")
+			if self.massCenter is not None:
+				lines.append(f"\t$masscenter {self.massCenter[0]:.2f} {self.massCenter[1]:.2f} {self.massCenter[2]:.2f}")
 			lines.append("}")
 
 			surfaceProp = self.__collision.getSurfaceProp()

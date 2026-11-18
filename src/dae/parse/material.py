@@ -740,6 +740,15 @@ class MaterialData(Terminable):
 	def getTextureSlots(self):
 		return self.__textureSlots
 
+	def tankCamoExponent(self):
+		if self.cls != "dynamic_masked_tank":
+			return None
+		try:
+			amp = float(self.getParams().get("camo_amplitude_tank") or 4.0)
+		except ValueError:
+			amp = 4.0
+		return 1.0 / abs(amp) if amp != 0 else 0.25
+
 	def convertTex(self, texture:str, data:bytes, texturePaths:TexturePathDict = None, forceConvert:bool = False, texN:str = None):
 		newName = None
 		key = MaterialData.getTexFileName(texture) if texN is None else texN
@@ -758,19 +767,30 @@ class MaterialData(Terminable):
 			img = Image.open(BytesIO(data))
 
 			if texType is not None and texType != TEXTURE_GENERIC:
+				hasAlpha = "A" in img.getbands()
 				r, g, b, a = img.convert("RGBA").split()
 				img.close()
 
 				if texType == TEXTURE_MASKED:
-					img = Image.merge("RGBA", (r, g, b, invert(a)))
+					exp = self.tankCamoExponent()
+					a = a.point([round((1.0 - (v / 255.0) ** exp) * 255.0) for v in range(256)]) if exp is not None else invert(a)
+					img = Image.merge("RGBA", (r, g, b, a))
 				elif texType == TEXTURE_GLASS: # War Thunder adds reflections on top, alone the alpha is nearly invisible
 					a = a.point(lambda v: 128 + v // 2)
 					img = Image.merge("RGBA", (r, g, b, a))
 				elif texType == TEXTURE_JET_FLAME:
 					img = jetFlameTexture(Image.merge("RGBA", (r, g, b, a)))
 				elif texType == TEXTURE_NORMAL:
-					whiteChannel = Image.new("L", img.size, 255)
-					img = Image.merge("RGBA", (a, g, whiteChannel, r))
+					import numpy as np
+					if hasAlpha and a.getextrema() != (255, 255):
+						nxCh, nyCh, specCh = a, g, r
+					else:
+						nxCh, nyCh, specCh = r, g, Image.new("L", r.size, 255)
+					nx = (np.asarray(nxCh, dtype=np.float32) - 127.5) / 127.5
+					ny = (np.asarray(nyCh, dtype=np.float32) - 127.5) / 127.5
+					nz = np.sqrt(np.maximum(0.0, 1.0 - nx * nx - ny * ny))
+					nzCh = Image.fromarray(np.rint((nz + 1.0) * 127.5).clip(0, 255).astype(np.uint8))
+					img = Image.merge("RGBA", (nxCh, nyCh, nzCh, specCh))
 			
 			outBin = BytesIO()
 			img.save(outBin, format = "DDS")

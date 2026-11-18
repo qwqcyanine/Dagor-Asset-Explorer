@@ -1,13 +1,15 @@
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QDialog, QWidget, QComboBox, QDoubleSpinBox, QFormLayout, QDialogButtonBox, QPushButton, QScrollArea
+from PyQt5.QtWidgets import QDialog, QWidget, QComboBox, QDoubleSpinBox, QFormLayout, QDialogButtonBox, QPushButton, QScrollArea, QLabel
+from util.enums import SETTINGS_VTF_FORMAT, VTF_FORMAT_DXT5, VTF_FORMAT_RGBA8888
 from util.i18n import tr
+from util.settings import SETTINGS
 from util.wtloadout import presetLabel
 
 
 class GlideOptionsDialog(QDialog):
 	"""Lets the user tweak vehicle stats before a Glide export. Values come prefilled from util.glide.defaultOptions."""
 
-	def __init__(self, parent:QWidget, options:dict, modelName=None, loadouts=(), slots=(), preview=None, weaponLabels=None):
+	def __init__(self, parent:QWidget, options:dict, modelName=None, loadouts=(), slots=(), preview=None, weaponLabels=None, gameRoot=None):
 		super().__init__(parent)
 
 		self.setWindowTitle(tr("Glide export options"))
@@ -81,23 +83,49 @@ class GlideOptionsDialog(QDialog):
 
 		self.spins = {}
 
-		for key, label, lo, hi, suffix, fallback in (
-			("mass", tr("Mass"), 100, 50000, " kg", 20000),
-			("maxFwdSpeed", tr("Max forward speed"), 5, 150, " km/h", 60),
-			("maxRevSpeed", tr("Max reverse speed"), 1, 150, " km/h", 15),
-			("maxSpeed", tr("Max flight speed"), 500, 10000, "", 2400),
-			("engineForce", tr("Engine thrust"), 50, 2000, "", 350),
+		for key, label, lo, hi, suffix, fallback, decimals in (
+			("mass", tr("Mass"), 100, 50000, " kg", 20000, 0),
+			("maxFwdSpeed", tr("Max forward speed"), 5, 150, " km/h", 60, 0),
+			("maxRevSpeed", tr("Max reverse speed"), 1, 150, " km/h", 15, 0),
+			("maxSpeed", tr("Max flight speed"), 500, 10000, "", 2400, 0),
+			("engineForce", tr("Engine thrust"), 50, 2000, "", 350, 0),
+			("suspensionSag", tr("Suspension sag"), 2.0, 50.0, " cm", 12.5, 1),
+			("suspensionDamping", tr("Suspension damping"), 10.0, 100.0, " %", 50.0, 1),
 		):
 			spin = QDoubleSpinBox()
 			spin.setRange(lo, hi)
-			spin.setDecimals(0)
+			spin.setDecimals(decimals)
 			spin.setSuffix(suffix)
 			spin.setValue(options.get(key, fallback))
 			self.form.addRow(label, spin)
 			self.spins[key] = spin
+		for key, tip in (
+			("suspensionSag", tr("Auto-filled from War Thunder. Smaller = stiffer spring (5–9 cm stiff, 10–15 cm medium/MBT, 18–30+ cm soft).")),
+			("suspensionDamping", tr("Auto-filled from War Thunder. Larger = firmer shock absorption & less bounce (20–35% soft/bouncy, 45–65% medium, 70–100% firm).")),
+		):
+			self.spins[key].setToolTip(tip)
+			lbl = self.form.labelForField(self.spins[key])
+			if lbl is not None:
+				lbl.setToolTip(tip)
+
+		self.suspensionHint = QLabel(tr(
+			"Sag (smaller = stiffer): 5–9 cm stiff | 10–15 cm medium | 18–30+ cm soft\n"
+			"Damping (larger = firmer): 20–35% bouncy | 45–65% medium | 70–100% firm"
+		))
+		self.suspensionHint.setProperty("muted", True)
+		self.suspensionHint.setWordWrap(True)
+		self.form.addRow(self.suspensionHint)
+
+		self.vtfFormat = QComboBox()
+		self.vtfFormat.addItem("DXT5", VTF_FORMAT_DXT5)
+		self.vtfFormat.addItem("RGBA8888", VTF_FORMAT_RGBA8888)
+		initFmt = options.get("vtfFormat") or SETTINGS.getValue(SETTINGS_VTF_FORMAT)
+		fmtIdx = self.vtfFormat.findData(initFmt)
+		self.vtfFormat.setCurrentIndex(fmtIdx if fmtIdx >= 0 else 0)
+		self.form.addRow(tr("VTF texture format"), self.vtfFormat)
 
 		from gui.skinImportWidget import SkinImportWidget
-		self.skins = SkinImportWidget(self, modelName)
+		self.skins = SkinImportWidget(self, modelName, gameRoot)
 		self.form.addRow(tr("MDL skins"), self.skins)
 
 		buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -127,6 +155,9 @@ class GlideOptionsDialog(QDialog):
 			self._setRowVisible(spin, not ground)
 		self._setRowVisible(self.spins["maxFwdSpeed"], ground)
 		self._setRowVisible(self.spins["maxRevSpeed"], ground)
+		self._setRowVisible(self.spins["suspensionSag"], ground)
+		self._setRowVisible(self.spins["suspensionDamping"], ground)
+		self.suspensionHint.setVisible(ground)
 		self._setRowVisible(self.spins["maxSpeed"], plane)
 		self._setRowVisible(self.spins["engineForce"], plane)
 		self.adjustSize()
@@ -136,6 +167,7 @@ class GlideOptionsDialog(QDialog):
 		if kind != "ground":
 			return {
 				"skins": self.skins.paths(),
+				"vtfFormat": self.vtfFormat.currentData(),
 				"aircraft": True,
 				"loadout": {index: combo.currentData() for index, combo in self.slotCombos.items()} if self.loadout.currentData() == "__custom__" else self.loadout.currentData(),
 				"reloadTimes": {key: spin.value() for key, spin in self.reloadSpins.items() if spin.value() > 0},
@@ -146,6 +178,7 @@ class GlideOptionsDialog(QDialog):
 			}
 		return {
 			"skins": self.skins.paths(),
+			"vtfFormat": self.vtfFormat.currentData(),
 			"aircraft": False,
 			"helicopter": False,
 			"singleFlow": self.transmission.currentData(),
@@ -154,4 +187,6 @@ class GlideOptionsDialog(QDialog):
 			"mass": self.spins["mass"].value(),
 			"maxFwdSpeed": self.spins["maxFwdSpeed"].value(),
 			"maxRevSpeed": self.spins["maxRevSpeed"].value(),
+			"suspensionSag": self.spins["suspensionSag"].value(),
+			"suspensionDamping": self.spins["suspensionDamping"].value(),
 		}

@@ -32,6 +32,7 @@ class Settings:
 		SETTINGS_EXPAND_ALL:False,
 		SETTINGS_LANGUAGE:"auto",
 		SETTINGS_THEME:THEME_DARK,
+		SETTINGS_VTF_FORMAT:VTF_FORMAT_DXT5,
 	}
 
 	def saveSettings(self):

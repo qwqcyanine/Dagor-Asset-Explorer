@@ -19,7 +19,7 @@ from threading import Event
 from parse.material import DDSx, DDSxTexturePack2
 from parse.realres import RendInst, DynModel, ModelContainer, GeomNodeTree
 from gui.glideOptionsDialog import GlideOptionsDialog
-from util.glide import GLIDE_KEEP_BONES, TRACK_R_SUFFIX, cacheHQTextures, compileSmokeModels, defaultOptions, findGameRoot, findTankBlk, glideCollisionNodes, hiddenNodes, prepareTankSmoke, splitTrackMaterials, writeAddon
+from util.glide import GLIDE_KEEP_BONES, TRACK_R_SUFFIX, cacheHQTextures, compileSmokeModels, defaultOptions, findGameRoot, findTankBlk, glideCollisionNodes, hiddenNodes, prepareTankSmoke, splitTrackMaterials, tankMassCenter, writeAddon
 from util.glide import aircraftCollisionNodes, aircraftHiddenNodes, aircraftKeepBones, controlSurfaces, findAircraftBlk, findAircraftCollision, gearSequences, isAircraft
 from util.a2d import A2D
 import re
@@ -584,6 +584,16 @@ class PreviewModel(CustomAction):
 
 
 
+def _resolveVtfFormat(action) -> str:
+	fmt = getattr(action, "vtfFormat", None)
+	if fmt not in (VTF_FORMAT_DXT5, VTF_FORMAT_RGBA8888):
+		try:
+			fmt = SETTINGS.getValue(SETTINGS_VTF_FORMAT)
+		except KeyError:
+			fmt = VTF_FORMAT_DXT5
+	return fmt if fmt in (VTF_FORMAT_DXT5, VTF_FORMAT_RGBA8888) else VTF_FORMAT_DXT5
+
+
 class ExportToSource(SaveAction):
 	def __init__(self, parent, item: SimpleItem, lod:int):
 		self.lod = lod
@@ -599,12 +609,21 @@ class ExportToSource(SaveAction):
 		return tr("Exporting LOD {lod} to {file}", lod = self.lod, file = f"{self.item.asset.name}.mdl")
 
 	def preRun(self):
-		from PyQt5.QtWidgets import QDialog, QVBoxLayout, QDialogButtonBox
+		from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QDialogButtonBox
 		from gui.skinImportWidget import SkinImportWidget
 		dialog = QDialog(self.mainWindow)
 		dialog.setWindowTitle(tr("MDL skins"))
 		layout = QVBoxLayout(dialog)
-		skins = SkinImportWidget(dialog, self.item.asset.name)
+		fmtRow = QHBoxLayout()
+		fmtRow.addWidget(QLabel(tr("VTF texture format")))
+		fmtBox = QComboBox()
+		fmtBox.addItem("DXT5", VTF_FORMAT_DXT5)
+		fmtBox.addItem("RGBA8888", VTF_FORMAT_RGBA8888)
+		fmtIdx = fmtBox.findData(_resolveVtfFormat(self))
+		fmtBox.setCurrentIndex(fmtIdx if fmtIdx >= 0 else 0)
+		fmtRow.addWidget(fmtBox)
+		layout.addLayout(fmtRow)
+		skins = SkinImportWidget(dialog, self.item.asset.name, findGameRoot(self.item.asset.filePath))
 		layout.addWidget(skins)
 		buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
 		buttons.accepted.connect(dialog.accept)
@@ -612,11 +631,14 @@ class ExportToSource(SaveAction):
 		layout.addWidget(buttons)
 		if dialog.exec_() != QDialog.Accepted:
 			return False
+		self.vtfFormat = fmtBox.currentData()
+		SETTINGS.setValue(SETTINGS_VTF_FORMAT, self.vtfFormat)
 		self.skinArchives = skins.paths()
 		return super().preRun()
 
 	modelPath = "dae_out"
 	skinArchives = ()
+	vtfFormat = None
 	keepBones = None
 	forcedSettings = {}
 
@@ -639,6 +661,7 @@ class ExportToSource(SaveAction):
 		dontCompile = self.setting(SETTINGS_NO_MDL)
 		dontReplaceTex = SETTINGS.getValue(SETTINGS_DONT_EXPORT_EXISTING_TEXTURES)
 		forceConvert = SETTINGS.getValue(SETTINGS_FORCE_DDS_CONVERSION)
+		vtfFormat = _resolveVtfFormat(self)
 
 		compiler = SETTINGS.getValue(SETTINGS_STUDIOMDL_PATH)
 		gameInfo = SETTINGS.getValue(SETTINGS_GAMEINFO_PATH)
@@ -682,7 +705,7 @@ class ExportToSource(SaveAction):
 			if not exportTex or not exportSMDs:
 				raise ValueError("Skin import requires SMD and texture export")
 			from util.wtskins import importSkins
-			report = importSkins(qc, smdl.model.materials, texturePaths, self.skinArchives, vtfCmd, asset.name)
+			report = importSkins(qc, smdl.model.materials, texturePaths, self.skinArchives, vtfCmd, asset.name, findGameRoot(asset.filePath), vtfFormat = vtfFormat)
 			for skin in report:
 				log.log(f"Skin {skin['skin']}: {skin['name']}; unused replacements: {skin['unused']}")
 		compileTargets = self.compileTargets(qc) if exportSMDs else []
@@ -785,23 +808,31 @@ class ExportToSource(SaveAction):
 					if path.exists(vtfFile):
 						remove(vtfFile)
 
-					jobs.append((k, texName, texFile, texOutPath, vtfFile))
+					jobs.append((k, texName, texFile, texOutPath, vtfFile, tex.texType))
 
 				if jobs:
 					stop = Event()
 
 					def convertOne(job):
-						_, texName, texFile, texOutPath, vtfFile = job
+						_, texName, texFile, texOutPath, vtfFile, texType = job
 						if stop.is_set() or self.shouldTerminate:
 							return False
 
-						pipes = Popen((
+						cmd = [
 							vtfCmd,
 							"-file",
 							path.normpath(texFile),
 							"-output",
-							texOutPath
-						))
+							texOutPath,
+							"-format",
+							vtfFormat,
+							"-alphaformat",
+							vtfFormat,
+						]
+						if texType == TEXTURE_NORMAL:
+							cmd += ["-flag", "NORMAL"]
+
+						pipes = Popen(cmd)
 
 						self.setSubProcess(pipes)
 						try:
@@ -916,12 +947,15 @@ class ExportToGlide(ExportToSource):
 			MessageBox(str(error)).exec_()
 			return False
 
-		dialog = GlideOptionsDialog(self.mainWindow, defaultOptions(self.blk), self.item.asset.name, presets(self.blk or {}), slots, self.previewLoadout, labels)
+		dialog = GlideOptionsDialog(self.mainWindow, defaultOptions(self.blk, asset.geomNodeTree), self.item.asset.name, presets(self.blk or {}), slots, self.previewLoadout, labels, findGameRoot(asset.filePath))
 
 		if dialog.exec_() != QDialog.Accepted:
 			return False
 
 		self.options = dialog.options()
+		self.vtfFormat = self.options.pop("vtfFormat", None)
+		if self.vtfFormat in (VTF_FORMAT_DXT5, VTF_FORMAT_RGBA8888):
+			SETTINGS.setValue(SETTINGS_VTF_FORMAT, self.vtfFormat)
 		self.skinArchives = self.options.pop("skins", [])
 		try:
 			if self.options.get("aircraft", isAircraft(self.blk)):
@@ -988,6 +1022,7 @@ class ExportToGlide(ExportToSource):
 			return
 
 		smdl.collisionNodeFilter = glideCollisionNodes
+		smdl.massCenter = tankMassCenter(self.blk, smdl.model.skeleton)
 		smdl.model.removeObjects(hiddenNodes(self.blk, self.options["upgraded"]))
 		self.tracks = splitTrackMaterials(smdl.model)
 		try:

@@ -122,6 +122,45 @@ class VMTTest(unittest.TestCase):
                 else:
                     self.assertNotIn('$alphatest', vmt)
 
+    def test_tank_camo_exponent_and_normal_unit_z(self):
+        from io import BytesIO
+        from PIL import Image
+
+        src = Image.new('RGBA', (2, 1))
+        src.putdata([(100, 110, 120, 0), (100, 110, 120, 128)])
+        buf = BytesIO()
+        src.save(buf, format='DDS')
+
+        tank = material('dynamic_masked_tank', {0: 'hull_c*', 1: 'camo*'}, 'camo_amplitude_tank=4')
+        tank_paths = TexturePathDict('wt')
+        tank.getVMT(tank_paths)
+        tank_out, _ = tank.convertTex('hull_c', buf.getvalue(), tank_paths, texN='hull_cm')
+        tank_alpha = list(Image.open(BytesIO(tank_out)).convert('RGBA').getchannel('A').get_flattened_data())
+        self.assertEqual(tank_alpha, [255, 40])
+
+        air = material('dynamic_masked_chrome_bump', {0: 'hull_c*'})
+        air_paths = TexturePathDict('wt')
+        air.getVMT(air_paths)
+        air_out, _ = air.convertTex('hull_c', buf.getvalue(), air_paths, texN='hull_cm')
+        air_alpha = list(Image.open(BytesIO(air_out)).convert('RGBA').getchannel('A').get_flattened_data())
+        self.assertEqual(air_alpha, [255, 127])
+
+        norm_mat = material('dynamic_masked_tank', {0: 'hull_c*', 2: 'hull_n*'})
+        norm_paths = TexturePathDict('wt')
+        norm_mat.getVMT(norm_paths)
+
+        rgba_n = Image.new('RGBA', (1, 1), (10, 128, 0, 200))
+        nbuf = BytesIO()
+        rgba_n.save(nbuf, format='DDS')
+        nout, _ = norm_mat.convertTex('hull_n', nbuf.getvalue(), norm_paths)
+        self.assertEqual(Image.open(BytesIO(nout)).convert('RGBA').getpixel((0, 0)), (200, 128, 232, 10))
+
+        rgb_n = Image.new('RGB', (1, 1), (200, 128, 0))
+        rgbbuf = BytesIO()
+        rgb_n.save(rgbbuf, format='DDS')
+        rgbout, _ = norm_mat.convertTex('hull_n', rgbbuf.getvalue(), norm_paths)
+        self.assertEqual(Image.open(BytesIO(rgbout)).convert('RGBA').getpixel((0, 0)), (200, 128, 232, 255))
+
     def test_alpha_blend_preserves_texture_coverage(self):
         from util.enums import TEXTURE_GENERIC
 

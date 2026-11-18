@@ -310,7 +310,7 @@ class AuditFixesTest(unittest.TestCase):
             names = [f"tex_{i}" for i in range(6)]
             for tex_name in names:
                 (out_model / "textures" / f"{tex_name}.dds").write_bytes(b"DDS ")
-                tex_paths.append(tex_name, 0, [], "basetexture")
+                tex_paths.append(tex_name, 1 if tex_name == "tex_0" else 0, [], "bumpmap" if tex_name == "tex_0" else "basetexture")
 
             smdl = SimpleNamespace(
                 name="plane",
@@ -335,6 +335,7 @@ class AuditFixesTest(unittest.TestCase):
             peak = 0
             tracked_procs = {}
             progress_updates = []
+            cmds = {}
             both_started = threading.Barrier(2, timeout=2.0)
 
             def fake_popen(cmd):
@@ -342,6 +343,7 @@ class AuditFixesTest(unittest.TestCase):
                 dds = Path(cmd[cmd.index("-file") + 1])
                 out_dir = Path(cmd[cmd.index("-output") + 1])
                 with lock:
+                    cmds[dds.stem] = list(cmd)
                     active += 1
                     peak = max(peak, active)
                 try:
@@ -382,6 +384,27 @@ class AuditFixesTest(unittest.TestCase):
             self.assertEqual(len(progress_updates), len(names) + 5)
             for tex_name in names:
                 self.assertTrue((out_model / "source_export/materials/models/dae_out" / f"{tex_name}.vtf").is_file())
+            self.assertIn("-format", cmds["tex_0"])
+            self.assertEqual(cmds["tex_0"][cmds["tex_0"].index("-format") + 1], "DXT5")
+            self.assertEqual(cmds["tex_0"][cmds["tex_0"].index("-alphaformat") + 1], "DXT5")
+            self.assertIn("-flag", cmds["tex_0"])
+            self.assertIn("NORMAL", cmds["tex_0"])
+            self.assertEqual(cmds["tex_1"][cmds["tex_1"].index("-format") + 1], "DXT5")
+            self.assertEqual(cmds["tex_1"][cmds["tex_1"].index("-alphaformat") + 1], "DXT5")
+            self.assertNotIn("-flag", cmds["tex_1"])
+
+            values[tree.SETTINGS_VTF_FORMAT] = "RGBA8888"
+            cmds.clear()
+            progress_updates.clear()
+            with patch.object(tree.SETTINGS, "getValue", side_effect=lambda k: values[k]), \
+                 patch.object(tree, "cacheHQTextures", return_value=0), \
+                 patch.object(tree, "Popen", side_effect=fake_popen):
+                tree.ExportToSource.save(action, str(root))
+            for tex_name in names:
+                self.assertEqual(cmds[tex_name][cmds[tex_name].index("-format") + 1], "RGBA8888")
+                self.assertEqual(cmds[tex_name][cmds[tex_name].index("-alphaformat") + 1], "RGBA8888")
+            self.assertIn("NORMAL", cmds["tex_0"])
+            self.assertNotIn("-flag", cmds["tex_1"])
 
     def test_main_window_subprocess_tracking_handles_concurrent_procs(self):
         import threading

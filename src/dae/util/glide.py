@@ -18,6 +18,8 @@ GLIDE_KEEP_BONES = {
 	*(f"bone_wheel_{s}_{i:02d}" for s in "lr" for i in range(1, 21)),
 	# the wheel meshes spin on their own bones: the track is skinned to bone_wheel_*, which only follows the suspension
 	*(f"wheel_{s}_{i:02d}" for s in "lr" for i in range(1, 21)),
+	*(f"wheel_{s}_{part}" for s in "lr" for part in ("drive", "front", "back", "top")),
+	*(f"wheel_{s}_{part}_{i:02d}" for s in "lr" for part in ("drive", "front", "back", "top") for i in range(1, 21)),
 }
 
 TRACK_R_SUFFIX = "_r"
@@ -32,8 +34,29 @@ TRACK_ROLLING = 0.05
 # the wheels get 0.5 * 0.5 + 0.5 * 0.5 of the engine output, measured in game
 GLIDE_POWER_SPLIT = 0.5
 BUMP_TRAVEL = 9.0
+DEFAULT_DAMPING_PCT = 50.0
 
-def defaultOptions(blk:dict):
+def tankSuspension(blk:dict, wheelCount:int = None):
+	"""(sagCm, bumpCm, dampingPct) from VehiclePhys.suspension, or defaults when absent."""
+	susp = ((blk or {}).get("VehiclePhys") or {}).get("suspension") or {}
+	soff = susp.get("suspensionOffsets")
+	wheeled = isWheeled(blk)
+
+	if isinstance(soff, (list, tuple)) and len(soff) >= 3:
+		s0, s2 = abs(float(soff[0])), abs(float(soff[2]))
+		sagCm = min(max(s0 * 100.0, 5.0), 22.0)
+		bumpCm = min(max(s2 * 100.0, 8.0 if wheeled else 12.0), 35.0)
+	else:
+		sagCm = REST_COMPRESSION / VERTEX_SCALE * 100.0
+		bumpCm = BUMP_TRAVEL / VERTEX_SCALE * 100.0
+
+	wc = max(int(wheelCount or (8 if wheeled else 12)), 1)
+	comp = float(susp.get("dampeningCompressionRatio") or 0.0)
+	dampingPct = min(max(round(comp * sqrt(wc) * 100.0, 1), 15.0), 85.0) if comp > 0 else DEFAULT_DAMPING_PCT
+
+	return round(sagCm, 1), round(bumpCm, 1), dampingPct
+
+def defaultOptions(blk:dict, skeleton = None):
 	"""Export options the user can edit, prefilled from the War Thunder vehicle blk."""
 	if isAircraft(blk):
 		fm = (blk or {}).get("fm") or {}
@@ -50,6 +73,8 @@ def defaultOptions(blk:dict):
 	phys = blk.get("VehiclePhys", {})
 	mech = phys.get("mechanics") or {}
 	mass = phys.get("Mass", {}).get("TakeOff", blk.get("mass", 20000))
+	wheelCount = len(getWheels(skeleton)) if skeleton is not None else None
+	sagCm, _, dampingPct = tankSuspension(blk, wheelCount)
 
 	return {
 		# WT tanks with neutralGearRatio (e.g. ZTZ-99A, Leopard 2, Abrams) have dual-flow neutral counter-rotation;
@@ -58,6 +83,8 @@ def defaultOptions(blk:dict):
 		"mass": min(float(mass), 50000), # GMod clamps physics mass to 50000
 		"maxFwdSpeed": float(blk.get("maxFwdSpeed", 60)),
 		"maxRevSpeed": float(blk.get("maxRevSpeed", 15)),
+		"suspensionSag": sagCm,
+		"suspensionDamping": dampingPct,
 		"upgraded": True,
 		"wheeled": isWheeled(blk),
 	}
@@ -204,6 +231,28 @@ def findTankBlk(assetPath:str, modelName:str):
 def gamePos(node):
 	# WT is Y-up with +z left; Source is Z-up with +y left
 	return (node.wtm[0][3] * VERTEX_SCALE, node.wtm[2][3] * VERTEX_SCALE, node.wtm[1][3] * VERTEX_SCALE)
+
+def tankMassCenter(blk:dict, skeleton = None):
+	"""Source-space (x, y, z) center of mass from VehiclePhys.Mass.CenterOfGravity (or road-wheel midpoint fallback)."""
+	mass = ((blk or {}).get("VehiclePhys") or {}).get("Mass") or {}
+	cog = mass.get("CenterOfGravity")
+
+	if isinstance(cog, (list, tuple)) and len(cog) >= 3:
+		x, y, z = float(cog[0]), float(cog[1]), float(cog[2])
+		clampY = mass.get("CenterOfGravityClampY")
+
+		if isinstance(clampY, (list, tuple)) and len(clampY) >= 2:
+			y = min(max(y, float(clampY[0])), float(clampY[1]))
+
+		if all(isfinite(v) for v in (x, y, z)):
+			return (x * VERTEX_SCALE, z * VERTEX_SCALE, y * VERTEX_SCALE)
+
+	wheels = getWheels(skeleton) if skeleton is not None else ()
+
+	if wheels:
+		return (sum(w[1][0] for w in wheels) / len(wheels), 0.0, max(wheels[0][1][2], 5.0))
+
+	return None
 
 def vec(p):
 	return f"Vector( {p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f} )"
@@ -691,16 +740,18 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 	turretTilt = turretTilt if turret is not None and gun is not None and abs(turretTilt) < 15 and abs(gunTilt - turretTilt) < 1 else 0.0
 	wtYawMin, wtYawMax, wtPitchMin, wtPitchMax, limitsTable = turretLimits(weapon, turretTilt)
 	yawConstrained = wtYawMin > -179.9 or wtYawMax < 179.9
-	options = {**defaultOptions(blk), **(options or {})}
+	wheels = getWheels(skeleton)
+	options = {**defaultOptions(blk, skeleton), **(options or {})}
 	mass = min(float(options["mass"]), 50000)
 	massScale = mass / 20000 # base_glide_tank is tuned for its 20000 kg default
-	wheels = getWheels(skeleton)
 	wheeled = isWheeled(blk)
 	steer = steering(blk) if wheeled else {}
 	maxSteer = max((a for _, a in steer.values()), default = 30.0)
 	radius = max(wheels[0][1][2], 5) if wheels else 15
 	gears, revRatio, topForce, torqueRise = gearbox(blk, options)
 	top = gears[-1]
+	mech = ((blk or {}).get("VehiclePhys") or {}).get("mechanics") or {}
+	neutralRatio = min(float(mech.get("neutralGearRatio") or gears[0]), 20.0)
 	# Glide couples engine rpm = wheel rpm * gear * differential * 60 / tau (sic), so the redline (6000) in top gear caps the speed
 	maxWheelRPM = options["maxFwdSpeed"] / GLIDE_KMH / radius * 60 / (2 * pi)
 	diff = 6000 / (top * maxWheelRPM * 60 / (2 * pi))
@@ -712,12 +763,14 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 	resistScale = mass * GLIDE_WEIGHT * TRACK_ROLLING / (max(len(wheels), 1) * 0.05 * options["maxFwdSpeed"] / GLIDE_KMH)
 	# per wheel forces were calibrated on 6 physics wheels: keep the totals with any wheel count
 	perWheel = 6 / max(len(wheels), 1)
+	_, bumpCm, _ = tankSuspension(blk, len(wheels) or None)
+	restComp = max(float(options["suspensionSag"]), 2.0) / 100.0 * VERTEX_SCALE
+	lift = max(bumpCm, 2.0) / 100.0 * VERTEX_SCALE
+	zeta = min(max(float(options["suspensionDamping"]) / 100.0, 0.05), 1.0)
 	# put the wheels where the model has them once the springs settle
-	springStrength = mass * GLIDE_WEIGHT / (max(len(wheels), 1) * REST_COMPRESSION)
-	# keep base_glide_tank's damping ratio: critical damping grows with sqrt(stiffness)
-	baseSpring = 6000 * massScale * perWheel
-	springDamper = 30000 * massScale * perWheel * sqrt(springStrength / baseSpring)
-	lift = BUMP_TRAVEL
+	springStrength = mass * GLIDE_WEIGHT / (max(len(wheels), 1) * restComp)
+	# glide_wheel's 0.015 damper factor cancels Glide's 0.015 force scale, so c_crit = 2 * sqrt((k / 0.015) * m_wheel)
+	springDamper = zeta * 2.0 * sqrt((springStrength / 0.015) * (mass / max(len(wheels), 1)))
 	suspension = suspensionBones(wheels)
 	turretPos = gamePos(turret) if turret else (0, 0, 50)
 	seatPos = gamePos(driver) if driver else (0, 0, turretPos[2] * 0.5)
@@ -726,8 +779,8 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 
 	firstRight = next((k + 1 for k, w in enumerate(wheels) if w[0].startswith("bone_wheel_r_")), 1)
 	# middle unsteered road wheels always point along the hull, so neutral turns spin tracks in opposite directions
-	leftDrive = next((k + 1 for k, (name, _, i, cnt, _) in enumerate(wheels) if not name.startswith("bone_wheel_r_") and 0 < i < cnt - 1), 1)
-	rightDrive = next((k + 1 for k, (name, _, i, cnt, _) in enumerate(wheels) if name.startswith("bone_wheel_r_") and 0 < i < cnt - 1), firstRight)
+	leftDrive = next((k + 1 for k, (name, _, i, cnt, _) in enumerate(wheels) if not name.startswith("bone_wheel_r_") and i == cnt // 2), 1)
+	rightDrive = next((k + 1 for k, (name, _, i, cnt, _) in enumerate(wheels) if name.startswith("bone_wheel_r_") and i == cnt // 2), firstRight)
 	wheelBoneLines = []
 
 	for k, (name, p, i, cnt, n) in enumerate(wheels):
@@ -754,6 +807,12 @@ def generateLua(className:str, printName:str, modelPath:str, skeleton, blk:dict,
 		steerBone = steerBone or name
 		angle = angle if steerBone != spin else 0.0
 		wheelBoneLines.append(f'        {{ spin = "{spin}", steer = "{steerBone}", wheel = {drive}, angle = {angle:.1f} }},')
+	if not wheeled:
+		spun = {spinBone(w[4]) for w in wheels}
+		for side, drive in (("l", leftDrive), ("r", rightDrive)):
+			for n in skeleton.getNodes():
+				if n.name not in spun and re.fullmatch(f"wheel_{side}_(?:drive|front|back|top)(?:_\\d+)?", n.name):
+					wheelBoneLines.append(f'        {{ spin = "{n.name}", steer = "", wheel = {drive}, angle = 0.0 }},')
 	cdMaterials = modelPath[:-len(".mdl")]
 	trackLines = []
 
@@ -1484,6 +1543,26 @@ if SERVER then
         return selfTbl.forwardSpeed / {radius:.1f} * 60 / ( 2 * math.pi ) * selfTbl.gearRatios[gear] * self:GetDifferentialRatio() * 60 / ( 2 * math.pi )
     end
 
+    function ENT:GetTransmissionMaxRPM( gear, selfTbl )
+        local ratio = selfTbl.isTurningInPlace and {neutralRatio:.2f} or selfTbl.gearRatios[gear]
+        return self:GetFlywheelRPM() / ratio / self:GetDifferentialRatio()
+    end
+
+    -- War Thunder shifts gears under load without dropping the clutch or cutting throttle
+    function ENT:SwitchGear( index, _cooldown )
+        local prev = self:GetGear()
+        if prev == index then return end
+
+        index = math.Clamp( index, self.minGear, self.maxGear )
+        self.switchCD = 0
+
+        if index == 0 or ( prev > 0 ) ~= ( index > 0 ) then
+            self.clutch = 1
+        end
+
+        self:SetGear( index )
+    end
+
     ENT.SpawnPositionOffset = Vector( 0, 0, 50 )
 {nl.join(soundServer)}
 
@@ -1571,9 +1650,9 @@ if SERVER then
         end
     end
 
-    -- keep wheels aligned along the hull when clutch-braking so the braked inner track doesn't lock yaw
+    -- keep road wheels aligned along the hull during neutral/pivot turns so opposite track torques don't fight or cancel spin
     function ENT:UpdateSteering( dt, selfTbl )
-        if selfTbl.WTTracked and selfTbl.isTurningInPlace and selfTbl.WTSingleFlow then
+        if selfTbl.WTTracked and selfTbl.isTurningInPlace then
             local inputSteer = Glide.ExpDecay( selfTbl.inputSteer, self:GetInputFloat( 1, "steer" ), 4, dt )
 
             self:SetSteering( inputSteer )
@@ -1588,6 +1667,12 @@ if SERVER then
         BaseClass.WheelThink( self, dt, selfTbl )
 
         if not selfTbl.WTTracked then return end
+
+        local maxRPM = self:GetTransmissionMaxRPM( self:GetGear(), selfTbl )
+
+        for _, w in Glide.EntityPairs( selfTbl.wheels ) do
+            if w:GetRPM() < -maxRPM then w:SetRPM( -maxRPM ) end
+        end
 
         -- Glide gives every wheel a fixed share and drops the airborne ones' share; a track carries the
         -- sprocket's pull to whichever road wheels touch the ground, so they get their side's whole share
@@ -1623,7 +1708,7 @@ if SERVER then
             end
 
             if selfTbl.isTurningInPlace then
-                state.sideTractionMult = state.sideTractionMult * ( selfTbl.WTSingleFlow and 0.25 or 0.35 )
+                state.sideTractionMult = state.sideTractionMult * 0.15
             elseif steerMag > 0.1 then
                 if state.isOnRightSide == innerRight then
                     state.torque = state.torque * ( 1 - 0.85 * steerMag )
@@ -1640,12 +1725,6 @@ if SERVER then
                 local cap = w.params.forwardTractionMax * grip * state.forwardTractionMult * 0.90
                 state.torque = math.Clamp( state.torque, -cap, cap )
             end
-        end
-
-        local maxRPM = self:GetTransmissionMaxRPM( self:GetGear(), selfTbl )
-
-        for _, w in Glide.EntityPairs( selfTbl.wheels ) do
-            if w:GetRPM() < -maxRPM then w:SetRPM( -maxRPM ) end
         end
 
         if not selfTbl.WTSingleFlow or not selfTbl.isTurningInPlace then return end
@@ -1668,7 +1747,7 @@ if SERVER then
         self.engineBrakeTorque = {maxTorque * 40 / 35:.0f}
         self:SetBrakePower( {20000 * massScale * perWheel:.0f} )
         -- base_glide_tank's suspension is tuned for 20000 kg too
-        self:SetSuspensionLength( {REST_COMPRESSION + BUMP_TRAVEL:.1f} )
+        self:SetSuspensionLength( {restComp + lift:.1f} )
         self:SetSpringStrength( {springStrength:.0f} )
         self:SetSpringDamper( {springDamper:.0f} )
         -- and so is its traction: cap tracked forward traction to ~0.53g so 1st gear launches without wheelies
